@@ -1545,8 +1545,8 @@ impl Renderer {
         layers: u32,
         sprite_mips: &[crate::mipmap::Settings],
         animations: &[SpriteAnimation],
-        // Pixels, width, height and static rows (`HudAtlas::static_rows`).
-        hud_atlas: (&[u8], u32, u32, u32),
+        // Pixels, width, height, static rows and their key (`HudAtlas::static_rows`, `static_key`).
+        hud_atlas: (&[u8], u32, u32, u32, u64),
         hud_atlas_file: Option<&std::path::Path>,
         glint: (&[u8], u32, u32),
         glint_armor: (&[u8], u32, u32),
@@ -2337,7 +2337,8 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (atlas_pixels, atlas_width, atlas_height, atlas_static_rows) = hud_atlas;
+        let (atlas_pixels, atlas_width, atlas_height, atlas_static_rows, atlas_static_key) =
+            hud_atlas;
         log::info!(
             "Horizon: shared atlas {atlas_width}x{atlas_height}, {} MiB",
             u64::from(atlas_width) * u64::from(atlas_height) * 4 / (1024 * 1024)
@@ -2360,7 +2361,36 @@ impl Renderer {
             });
         // The atlas is two textures (`shared_atlas`): the static rows, packed
         // once, and the rows the game writes while it runs (font glyphs, skins,
-        // maps), which take RGBA at arbitrary positions.
+        // maps), which take RGBA at arbitrary positions. The static rows come
+        // from their ASTC bake (`--bake-atlas`) when this GPU samples ASTC and
+        // the spill is there for the whole-atlas copy to read them from.
+        let bake = || -> Option<shared_atlas::Baked> {
+            let source = hud_atlas_file?;
+            let path = astc::atlas_path(
+                source.parent()?,
+                atlas_width,
+                atlas_static_rows,
+                atlas_static_key,
+            );
+            let texture = astc::load(
+                &device,
+                &queue,
+                &path,
+                atlas_width,
+                atlas_static_rows,
+                "Shared atlas (static rows, ASTC)",
+            );
+            if texture.is_none() && astc::supported(&device) {
+                log::info!(
+                    "Horizon: no ASTC bake {} for the shared atlas's static rows, uploading RGBA",
+                    path.display()
+                );
+            }
+            Some(shared_atlas::Baked {
+                texture: texture?,
+                source: source.to_owned(),
+            })
+        };
         let atlas = match reused {
             Some(atlas) => {
                 log::info!(
@@ -2385,6 +2415,7 @@ impl Renderer {
                     atlas_width,
                     atlas_height,
                     atlas_static_rows,
+                    bake(),
                 );
                 let started = std::time::Instant::now();
                 let bytes_per_row = atlas_width * 4;
@@ -2393,7 +2424,8 @@ impl Renderer {
                 let mut file = std::fs::File::open(path).map_err(|e| {
                     format!("the shared atlas at {}: {e}", path.display())
                 })?;
-                let mut y = 0;
+                // Rows a bake holds already are not read.
+                let mut y = atlas.first_upload_row();
                 while y < atlas_height {
                     let height = rows.min(atlas_height - y);
                     let len = (height * bytes_per_row) as usize;
@@ -2417,6 +2449,7 @@ impl Renderer {
                     atlas_width,
                     atlas_height,
                     atlas_static_rows,
+                    bake(),
                 );
                 // `create_texture_with_data` stages the whole atlas (80 MiB on
                 // the default resources) in one buffer, which lands beside the
@@ -2425,7 +2458,7 @@ impl Renderer {
                 // the transient copy stays a few MiB.
                 let bytes_per_row = atlas_width * 4;
                 let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
-                let mut y = 0;
+                let mut y = atlas.first_upload_row();
                 while y < atlas_height {
                     let height = rows.min(atlas_height - y);
                     let start = (y * bytes_per_row) as usize;
@@ -2441,6 +2474,19 @@ impl Renderer {
                 atlas
             }
         };
+        let (upper, lower) = atlas.bytes();
+        log::info!(
+            "Horizon: shared atlas static rows {atlas_width}x{} {} ({} MiB), dynamic rows {atlas_width}x{} RGBA ({} MiB)",
+            atlas.static_rows,
+            if atlas.compressed() {
+                "from their ASTC bake"
+            } else {
+                "RGBA"
+            },
+            upper / (1024 * 1024),
+            atlas.height - atlas.static_rows,
+            lower / (1024 * 1024)
+        );
         let atlas_view = atlas.static_view.clone();
         let atlas_dynamic_view = atlas.dynamic_view.clone();
         // vanilla's `GlintSampler`: enchanted_glint_item as its own texture,
@@ -4496,7 +4542,7 @@ impl Renderer {
             let atlas = self.hud.atlas.as_mut()?;
             let mut encoder = self.device.create_command_encoder(&Default::default());
             let view = atlas
-                .combined(&self.device, &mut encoder)
+                .combined(&self.device, &self.queue, &mut encoder)
                 .create_view(&Default::default());
             self.queue.submit([encoder.finish()]);
             Some(view)
@@ -7064,7 +7110,9 @@ impl Renderer {
             // (made when the pack was set).
             let weather = match self.hud.atlas.as_mut() {
                 Some(atlas) if pack_draws_weather => {
-                    let atlas = atlas.combined(&self.device, &mut encoder).clone();
+                    let atlas = atlas
+                        .combined(&self.device, &self.queue, &mut encoder)
+                        .clone();
                     self.pack_weather
                         .get_or_insert_with(|| pack_weather::PackWeather::new(&self.device))
                         .prepare(
@@ -7191,10 +7239,11 @@ impl Renderer {
         if !frame.title {
             // A mod that samples the shared atlas gets it whole (`RenderNeeds::atlas`).
             let mod_atlas = if native_render::render_needs().atlas {
-                self.hud
-                    .atlas
-                    .as_mut()
-                    .map(|atlas| atlas.combined(&self.device, &mut encoder).clone())
+                self.hud.atlas.as_mut().map(|atlas| {
+                    atlas
+                        .combined(&self.device, &self.queue, &mut encoder)
+                        .clone()
+                })
             } else {
                 None
             };

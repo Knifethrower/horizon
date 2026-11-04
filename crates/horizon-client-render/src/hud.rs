@@ -66,6 +66,10 @@ pub struct HudAtlas {
     /// own (`gfx::shared_atlas`), so the static part can be compressed. A
     /// multiple of the ASTC block.
     pub static_rows: u32,
+    /// The content key of the static rows' pixels (`astc::content_key`): the
+    /// name of their ASTC bake (`astc::atlas_path`), read while the pixels are
+    /// still in memory.
+    pub static_key: u64,
     pub sprites: HashMap<String, Rect>,
     /// Resolved player-profile names and UUIDs for inline head components.
     pub object_skins: HashMap<String, String>,
@@ -548,6 +552,7 @@ impl HudAtlas {
             rect(0, static_rows, width, glyph_top, width, text_rows),
         );
         let white = sprites["horizon/white"];
+        let static_key = crate::astc::content_key(&pixels[..(static_rows * width * 4) as usize]);
         Self {
             font: crate::font::Font::load(
                 Path::new("horizon-boot"),
@@ -561,6 +566,7 @@ impl HudAtlas {
             width,
             height,
             static_rows,
+            static_key,
             sprites,
             translucent: HashSet::new(),
             flags: HashMap::new(),
@@ -889,11 +895,19 @@ impl HudAtlas {
             (glyph_region, height - glyph_region),
             white,
         );
+        // The drawn atlas's static rows are final here: their key names their
+        // ASTC bake. The fonts-only atlas is never drawn.
+        let static_key = if full {
+            crate::astc::content_key(&pixels[..(static_rows * width * 4) as usize])
+        } else {
+            0
+        };
         Ok(Self {
             pixels,
             width,
             height,
             static_rows,
+            static_key,
             sprites,
             object_skins: HashMap::new(),
             translucent,
@@ -2012,7 +2026,7 @@ impl HudRenderer {
             let atlas = self.atlas.as_mut()?;
             let mut encoder = device.create_command_encoder(&Default::default());
             let view = atlas
-                .combined(device, &mut encoder)
+                .combined(device, queue, &mut encoder)
                 .create_view(&Default::default());
             queue.submit([encoder.finish()]);
             pack_text::PackText::new(device, self.format, &view, shader)

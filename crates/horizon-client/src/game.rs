@@ -18713,7 +18713,13 @@ fn build_renderer(
         assets.texture_layers,
         &assets.sprite_mips,
         &assets.animations,
-        (&atlas.pixels, atlas.width, atlas.height, atlas.static_rows),
+        (
+            &atlas.pixels,
+            atlas.width,
+            atlas.height,
+            atlas.static_rows,
+            atlas.static_key,
+        ),
         gui.atlas_file.as_deref(),
         (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
         (
@@ -18769,8 +18775,14 @@ fn loading_renderer(
         pixels: [0u8; 4].repeat(6),
     };
     let panorama = panorama.unwrap_or(&empty_panorama);
-    let (pixels, width, height, static_rows) = atlas.map_or((EMPTY_HUD.as_slice(), 1, 2, 1), |a| {
-        (a.pixels.as_slice(), a.width, a.height, a.static_rows)
+    let hud_atlas = atlas.map_or((EMPTY_HUD.as_slice(), 1, 2, 1, 0), |a| {
+        (
+            a.pixels.as_slice(),
+            a.width,
+            a.height,
+            a.static_rows,
+            a.static_key,
+        )
     });
     let (glint_pixels, glint_width, glint_height) = atlas
         .map_or((EMPTY_GLINT.as_slice(), 1, 1), |a| {
@@ -18791,7 +18803,7 @@ fn loading_renderer(
         1,
         &[],
         &[],
-        (pixels, width, height, static_rows),
+        hud_atlas,
         atlas_file,
         (glint_pixels, glint_width, glint_height),
         (glint_pixels, glint_width, glint_height),
@@ -19640,19 +19652,41 @@ fn bake_atlas(options: &Options, vanilla_root: &std::path::Path) -> Result<()> {
     );
     let dir = std::env::current_dir()?.join("cache");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("hud-atlas-{}x{}.astc", atlas.width, atlas.height));
+    // Only the static rows: the rows below them are written while the game
+    // runs, which an ASTC texture cannot take (`gfx::shared_atlas`).
+    let rows = atlas.static_rows;
+    let path = horizon_client::astc::atlas_path(&dir, atlas.width, rows, atlas.static_key);
     let started = Instant::now();
-    horizon_client::astc::encode(&encoder, &atlas.pixels, atlas.width, atlas.height, &path)
-        .map_err(|e| e.to_string())?;
+    let static_bytes = (atlas.width * rows * 4) as usize;
+    horizon_client::astc::encode(
+        &encoder,
+        &atlas.pixels[..static_bytes],
+        atlas.width,
+        rows,
+        &path,
+    )
+    .map_err(|e| e.to_string())?;
     let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
     log::info!(
         "Horizon: baked {} ({} MiB, {:.1} bpp) with {} in {:.1} s",
         path.display(),
         bytes / (1024 * 1024),
-        (bytes * 8) as f64 / (f64::from(atlas.width) * f64::from(atlas.height)),
+        (bytes * 8) as f64 / (f64::from(atlas.width) * f64::from(rows)),
         encoder.display(),
         started.elapsed().as_secs_f32()
     );
+    // Earlier bakes of the atlas (other textures, or the whole atlas as
+    // builds before the split baked it) are never read again.
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(horizon_client::astc::ATLAS_PREFIX)
+            && name.ends_with(".astc")
+            && entry.path() != path
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
     println!("{}", path.display());
     // The block sprite arrays, packed exactly as the renderer packs them at
     // startup, so the renderer finds a bake that matches its bytes.

@@ -5,10 +5,14 @@
 //! game's shaders read them as one (`atlas_sample` in hud.wgsl, entity.wgsl and
 //! screen.wgsl), so the static part can be held in a form that takes no run-time writes.
 //!
+//! The static part is the ASTC bake of those rows ([`Baked`]) when there is one and the GPU
+//! samples ASTC: a byte a texel instead of four. It then takes no writes at all.
+//!
 //! What samples the atlas without those shaders (a resource pack's text shader, a shader
 //! pack, a native mod) gets [`SharedAtlas::combined`]: both parts in one texture, made the
 //! first time it is asked for and kept up to date from then on.
 use super::upload::Uploads;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct SharedAtlas {
@@ -21,7 +25,17 @@ pub struct SharedAtlas {
     dynamic_part: wgpu::Texture,
     pub static_view: wgpu::TextureView,
     pub dynamic_view: wgpu::TextureView,
+    /// With an ASTC static part: the RGBA spill of the whole atlas, which
+    /// [`Self::combined`] reads the static rows from.
+    static_source: Option<PathBuf>,
     combined: Option<wgpu::Texture>,
+}
+
+/// The static rows as their ASTC bake, and the RGBA spill of the whole atlas
+/// they were baked from (an ASTC texture copies into no RGBA texture).
+pub struct Baked {
+    pub texture: wgpu::Texture,
+    pub source: PathBuf,
 }
 
 /// The rows `y..y + rows` of the atlas that fall in one part: the part, the
@@ -34,12 +48,25 @@ struct Span<'a> {
 }
 
 impl SharedAtlas {
-    /// Empty textures for a `width` by `height` atlas whose first `static_rows`
-    /// rows are its static part. Both parts keep at least a row.
-    pub fn new(device: &wgpu::Device, width: u32, height: u32, static_rows: u32) -> Self {
+    /// Textures for a `width` by `height` atlas whose first `static_rows` rows
+    /// are its static part: `baked` for those when given, else empty RGBA ones.
+    /// Both parts keep at least a row.
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        static_rows: u32,
+        baked: Option<Baked>,
+    ) -> Self {
         let height = height.max(2);
         let static_rows = static_rows.clamp(1, height - 1);
-        let static_part = rgba_texture(device, "Shared atlas (static rows)", width, static_rows);
+        let (static_part, static_source) = match baked {
+            Some(baked) => (baked.texture, Some(baked.source)),
+            None => (
+                rgba_texture(device, "Shared atlas (static rows)", width, static_rows),
+                None,
+            ),
+        };
         let dynamic_part = rgba_texture(
             device,
             "Shared atlas (dynamic rows)",
@@ -54,13 +81,40 @@ impl SharedAtlas {
             dynamic_view: dynamic_part.create_view(&Default::default()),
             static_part,
             dynamic_part,
+            static_source,
             combined: None,
         }
     }
-    /// The parts rows `y..y + rows` fall in.
+    /// Whether the static part is the ASTC bake, which takes no writes.
+    pub fn compressed(&self) -> bool {
+        self.static_source.is_some()
+    }
+    /// The first row the packed pixels still have to be uploaded from: past
+    /// the static rows when their bake holds them already.
+    pub fn first_upload_row(&self) -> u32 {
+        if self.compressed() {
+            self.static_rows
+        } else {
+            0
+        }
+    }
+    /// What the GPU holds of each part, in bytes: (static, dynamic).
+    pub fn bytes(&self) -> (u64, u64) {
+        let rgba = |rows: u32| u64::from(self.width) * u64::from(rows) * 4;
+        let upper = if self.compressed() {
+            crate::astc::encoded_len(self.width, self.static_rows)
+        } else {
+            rgba(self.static_rows)
+        };
+        (upper, rgba(self.height - self.static_rows))
+    }
+    /// The parts rows `y..y + rows` fall in that can be written: not the static
+    /// part when it is the ASTC bake.
     fn spans(&self, y: u32, rows: u32) -> impl Iterator<Item = Span<'_>> {
-        split_rows(self.static_rows, self.height, y, rows).map(move |(dynamic, top, skip, rows)| {
-            Span {
+        let compressed = self.compressed();
+        split_rows(self.static_rows, self.height, y, rows)
+            .filter(move |&(dynamic, ..)| dynamic || !compressed)
+            .map(move |(dynamic, top, skip, rows)| Span {
                 texture: if dynamic {
                     &self.dynamic_part
                 } else {
@@ -69,8 +123,7 @@ impl SharedAtlas {
                 top,
                 skip,
                 rows,
-            }
-        })
+            })
     }
     /// Write whole rows of the atlas from row `y` (tightly packed RGBA, the full
     /// width) through the queue: the upload of its packed pixels.
@@ -138,24 +191,35 @@ impl SharedAtlas {
         }
     }
     /// The whole atlas as one RGBA texture, for what samples it without the
-    /// game's shaders: copied from the two parts the first time, then kept up to
+    /// game's shaders: copied from the two parts the first time (the static
+    /// rows read from the spill when they are the ASTC bake), then kept up to
     /// date by [`Self::write`]. It costs the memory the split saves, so only
     /// those users make it.
     pub fn combined(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) -> &wgpu::Texture {
         if self.combined.is_none() {
             let texture = rgba_texture(device, "Shared atlas (whole)", self.width, self.height);
-            for (part, y, rows) in [
-                (&self.static_part, 0, self.static_rows),
-                (
-                    &self.dynamic_part,
-                    self.static_rows,
-                    self.height - self.static_rows,
-                ),
-            ] {
+            let mut parts = vec![(
+                &self.dynamic_part,
+                self.static_rows,
+                self.height - self.static_rows,
+            )];
+            match &self.static_source {
+                Some(source) => {
+                    if let Err(e) = self.static_rows_from(source, queue, &texture) {
+                        log::warn!(
+                            "Horizon: the whole shared atlas has no static rows: {}: {e}",
+                            source.display()
+                        );
+                    }
+                }
+                None => parts.push((&self.static_part, 0, self.static_rows)),
+            }
+            for (part, y, rows) in parts {
                 encoder.copy_texture_to_texture(
                     copy_target(part, 0, 0),
                     copy_target(&texture, 0, y),
@@ -174,6 +238,42 @@ impl SharedAtlas {
             self.combined = Some(texture);
         }
         self.combined.as_ref().expect("made just above")
+    }
+    /// The static rows of the RGBA spill at `source` into `texture`, a band at
+    /// a time, so the transient copy stays a few MiB.
+    fn static_rows_from(
+        &self,
+        source: &std::path::Path,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+    ) -> std::io::Result<()> {
+        use std::io::Read as _;
+        let bytes_per_row = self.width * 4;
+        let band = (4 * 1024 * 1024 / bytes_per_row).clamp(1, self.static_rows);
+        let mut buf = vec![0u8; (band * bytes_per_row) as usize];
+        let mut file = std::fs::File::open(source)?;
+        let mut y = 0;
+        while y < self.static_rows {
+            let rows = band.min(self.static_rows - y);
+            let len = (rows * bytes_per_row) as usize;
+            file.read_exact(&mut buf[..len])?;
+            queue.write_texture(
+                copy_target(texture, 0, y),
+                &buf[..len],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(rows),
+                },
+                wgpu::Extent3d {
+                    width: self.width,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+            y += rows;
+        }
+        Ok(())
     }
 }
 

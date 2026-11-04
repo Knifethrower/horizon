@@ -46,10 +46,14 @@ pub fn supported(device: &wgpu::Device) -> bool {
         .contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC)
 }
 
-/// The baked file beside a spill: `hud-atlas-4096x5120.rgba` -> `.astc`.
-pub fn cache_path(rgba: &Path) -> PathBuf {
-    rgba.with_extension("astc")
+/// The bake of a shared atlas's static rows (`HudAtlas::static_rows`): its
+/// width, those rows and their content key (`HudAtlas::static_key`), so a bake
+/// of other textures of the same size is never taken for this one.
+pub fn atlas_path(dir: &Path, width: u32, rows: u32, key: u64) -> PathBuf {
+    dir.join(format!("{ATLAS_PREFIX}{width}x{rows}-{key:016x}.astc"))
 }
+/// The start of every shared atlas bake's name, old ones included.
+pub const ATLAS_PREFIX: &str = "hud-atlas-";
 
 /// The encoder to run: `tools/astcenc` beside the executable, or
 /// `HORIZON_ASTCENC`. `None` leaves the RGBA path in place.
@@ -68,26 +72,26 @@ pub fn find_encoder() -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// Upload a baked image as a texture, or `None` when the file is missing, the
-/// wrong size for this atlas, or unreadable. The file holds raw blocks (a bake
-/// from an older build may still carry `astcenc`'s 16-byte container header,
-/// which is skipped). Streams a band of block rows at a time so the transient
-/// copy stays a megabyte or two, as the RGBA path does.
+/// Upload the baked image at `path` as a texture, or `None` when this GPU
+/// does not sample ASTC, or the file is missing, the wrong size for this
+/// image, or unreadable. The file holds raw blocks (a bake from an older build
+/// may still carry `astcenc`'s 16-byte container header, which is skipped).
+/// Streams a band of block rows at a time so the transient copy stays a
+/// megabyte or two, as the RGBA path does.
 pub fn load(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    rgba: &Path,
+    path: &Path,
     width: u32,
     height: u32,
     label: &str,
 ) -> Option<wgpu::Texture> {
-    let path = cache_path(rgba);
     let want = encoded_len(width, height);
     if !supported(device) {
         return None;
     }
-    let mut file = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
-    let len = std::fs::metadata(&path).ok()?.len();
+    let mut file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let len = std::fs::metadata(path).ok()?.len();
     if len == want + 16 {
         // A bake from a build that kept `astcenc`'s container header: the
         // blocks are the same, they just start sixteen bytes in.
@@ -585,4 +589,28 @@ pub fn encode_array(
         file.flush().map_err(|e| format!("{}: {e}", tmp.display()))?;
     }
     std::fs::rename(&tmp, out).map_err(|e| format!("{}: {e}", out.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bake of a shared atlas's static rows is named by their size and
+    /// content key: another pack's atlas of the same size never matches it.
+    #[test]
+    fn an_atlas_bake_is_named_by_its_content() {
+        let dir = Path::new("cache");
+        let path = atlas_path(dir, 4096, 2608, 0xabc);
+        assert_eq!(
+            path,
+            Path::new("cache/hud-atlas-4096x2608-0000000000000abc.astc")
+        );
+        assert_ne!(path, atlas_path(dir, 4096, 2608, 0xabd));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(ATLAS_PREFIX)
+        );
+    }
 }

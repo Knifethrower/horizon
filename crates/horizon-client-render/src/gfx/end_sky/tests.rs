@@ -167,7 +167,7 @@ fn separate_draws_match_combined_celestial_pixels() {
         .collect();
     // The shared atlas as the game holds it (gfx/shared_atlas.rs): these 16
     // rows are its static part, with a row of dynamic part below them.
-    let atlas = crate::gfx::shared_atlas::SharedAtlas::new(&device, 16, 17, 16);
+    let atlas = crate::gfx::shared_atlas::SharedAtlas::new(&device, 16, 17, 16, None);
     atlas.write_rows(&queue, 0, &pixels);
     let lightmap = texture(&[255; 4], 1, 1).create_view(&Default::default());
     let sampler = device.create_sampler(&Default::default());
