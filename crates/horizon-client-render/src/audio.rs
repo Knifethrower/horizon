@@ -166,15 +166,56 @@ const SAME_SOUND: std::time::Duration = std::time::Duration::from_millis(150);
 /// Decoded samples and their rate (`None`: the file did not load).
 type Samples = Option<(Arc<Vec<f32>>, u32)>;
 /// Decoded static sounds (`SoundBufferLibrary`'s buffers), dropped least
-/// recently used first past `CACHE_BYTES`: kept forever, every sound heard in
+/// recently used first past `budget`: kept forever, every sound heard in
 /// a session stayed (up to 1.4 GiB of samples, villages playing hundreds).
-#[derive(Default)]
 struct SoundCache {
     entries: HashMap<String, (Samples, u64)>,
     bytes: usize,
     clock: u64,
+    /// Bytes of samples kept ([`cache_budget`]).
+    budget: usize,
 }
+impl Default for SoundCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            clock: 0,
+            budget: cache_budget(),
+        }
+    }
+}
+/// The most the sound cache keeps, on a machine with RAM to spare.
 const CACHE_BYTES: usize = 64 << 20;
+/// The cache's share of the machine's RAM where [`CACHE_BYTES`] is more.
+const CACHE_RAM_SHARE: u64 = 32;
+/// The sound cache's budget on this device: [`CACHE_BYTES`], or a
+/// thirty-second of the machine's RAM when that is smaller. Every static sound
+/// of a session decodes to 1.4 GiB of `f32`, so the cache fills to whatever it
+/// is given and stays there, beside a game that has no swap to fall back on on
+/// a 1 GB handheld. Past the budget a sound is decoded again the next time it
+/// plays. Read once; no env var, as `sprites::array_budget`.
+fn cache_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let total = fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+        let budget = budget_for(total);
+        log::info!("Horizon: sound cache budget {} MiB", budget >> 20);
+        budget
+    })
+}
+/// [`cache_budget`] for a machine with `total` bytes of RAM (`None`: unknown).
+fn budget_for(total: Option<u64>) -> usize {
+    total.map_or(CACHE_BYTES, |bytes| {
+        usize::try_from(bytes / CACHE_RAM_SHARE).map_or(CACHE_BYTES, |share| share.min(CACHE_BYTES))
+    })
+}
 impl SoundCache {
     fn get(&mut self, key: &str) -> Option<Samples> {
         self.clock += 1;
@@ -188,7 +229,7 @@ impl SoundCache {
         if let Some((old, _)) = self.entries.insert(key, (samples, self.clock)) {
             self.bytes -= Self::size(&old);
         }
-        while self.bytes > CACHE_BYTES && self.entries.len() > 1 {
+        while self.bytes > self.budget && self.entries.len() > 1 {
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -1672,14 +1713,14 @@ mod tests {
     #[test]
     fn decoded_sounds_stay_within_the_budget_least_recently_used_out() {
         let mut cache = SoundCache::default();
-        let quarter = CACHE_BYTES / 4 / std::mem::size_of::<f32>();
+        let quarter = cache.budget / 4 / std::mem::size_of::<f32>();
         let sound = || Some((Arc::new(vec![0.0f32; quarter]), 44100));
         for key in ["a", "b", "c", "d"] {
             cache.insert(key.into(), sound());
         }
         assert!(cache.get("a").is_some());
         cache.insert("e".into(), sound());
-        assert!(cache.bytes <= CACHE_BYTES);
+        assert!(cache.bytes <= cache.budget);
         assert!(
             cache.get("b").is_none(),
             "the least recently used goes first"
@@ -1688,6 +1729,17 @@ mod tests {
         // A failed load is remembered without counting.
         cache.insert("missing".into(), None);
         assert_eq!(cache.get("missing"), Some(None));
+    }
+    /// The cache takes a thirty-second of the RAM, never more than
+    /// `CACHE_BYTES`, and all of `CACHE_BYTES` where the RAM is unknown.
+    #[test]
+    fn the_sound_cache_budget_follows_the_machines_ram() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(budget_for(None), CACHE_BYTES);
+        assert_eq!(budget_for(Some(16 * GIB)), CACHE_BYTES);
+        assert_eq!(budget_for(Some(2 * GIB)), CACHE_BYTES);
+        assert_eq!(budget_for(Some(GIB)), 32 << 20);
+        assert_eq!(budget_for(Some(GIB / 2)), 16 << 20);
     }
     /// A streamed sound plays sample for sample as the same sound decoded
     /// whole, and its decoder never runs more than a packet past `ahead`.
