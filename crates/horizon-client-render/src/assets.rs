@@ -6,7 +6,12 @@ use horizon_world::{
     worldgen::{tags::TagDefinitions, terrain::TerrainBlockStates},
 };
 use serde_json::Value;
-use std::{collections::BTreeSet, io, path::Path, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fs, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub const MATERIALS: [&str; 6] = ["bedrock", "dirt", "stone", "sand", "oak_planks", "bricks"];
 #[derive(Clone, Copy)]
@@ -113,14 +118,20 @@ pub struct RenderAssets {
 /// window, a lost device, another graphics API), which waits for
 /// [`Self::get`] to uncompress them. Shared by the window and the workers'
 /// `RenderAssets`, so the compressed form replaces the raw one in place.
+///
+/// [`Self::spill`] moves them to a file instead, as the GUI atlas's pixels
+/// are, and `get` reads them back: what a 1 GB handheld otherwise carries
+/// through the whole session (20 MiB at 64 px) leaves memory altogether.
 pub struct SpritePixels(Arc<PixelStore>);
 struct PixelStore {
     len: usize,
-    /// Set by the first `pack`: later calls cost one atomic read.
+    /// Set by the first `pack` or `spill`: later calls cost one atomic read.
     packing: std::sync::atomic::AtomicBool,
-    /// As built; dropped once `packed` holds them.
+    /// As built; dropped once `packed` or `file` holds them.
     raw: std::sync::Mutex<Option<Arc<Vec<u8>>>>,
     packed: std::sync::OnceLock<Vec<u8>>,
+    /// Where `spill` wrote them.
+    file: std::sync::OnceLock<PathBuf>,
 }
 impl SpritePixels {
     pub fn new(pixels: Vec<u8>) -> Self {
@@ -129,6 +140,7 @@ impl SpritePixels {
             packing: std::sync::atomic::AtomicBool::new(false),
             raw: std::sync::Mutex::new(Some(Arc::new(pixels))),
             packed: std::sync::OnceLock::new(),
+            file: std::sync::OnceLock::new(),
         }))
     }
     /// Their size in bytes, uncompressed.
@@ -138,10 +150,24 @@ impl SpritePixels {
     pub fn is_empty(&self) -> bool {
         self.0.len == 0
     }
-    /// The pixels as built, uncompressed again once packed.
+    /// The pixels as built, uncompressed again once packed or read back once
+    /// spilled.
     pub fn get(&self) -> Arc<Vec<u8>> {
         let raw = self.0.raw.lock().unwrap_or_else(|e| e.into_inner()).clone();
         raw.unwrap_or_else(|| {
+            if let Some(path) = self.0.file.get() {
+                return Arc::new(match fs::read(path) {
+                    Ok(pixels) if pixels.len() == self.0.len => pixels,
+                    read => {
+                        let why = read.map_or_else(|e| e.to_string(), |_| "another size".into());
+                        log::warn!(
+                            "Horizon: {} no longer holds the block sprite pixels ({why})",
+                            path.display()
+                        );
+                        vec![0; self.0.len]
+                    }
+                });
+            }
             let packed = self.0.packed.get().map(Vec::as_slice).unwrap_or_default();
             Arc::new(
                 lz4_flex::decompress_size_prepended(packed)
@@ -176,7 +202,62 @@ impl SpritePixels {
             fallback();
         }
     }
+    /// Move them to a file in `dir` and drop them from memory, in place of
+    /// [`Self::pack`]; the file's name is their content's key, so a file of
+    /// that name already there holds them and is kept (a launch with the same
+    /// textures writes nothing). Spills of other textures there go. When the
+    /// file cannot be written they stay as they were, and `pack` compresses
+    /// them after all. This blocks while it hashes and writes: call it off the
+    /// render thread. `None`: nothing to spill, or packed or spilled already.
+    pub fn spill(&self, dir: &Path, stem: &str) -> io::Result<Option<PathBuf>> {
+        use std::sync::atomic::Ordering;
+        if self.0.len == 0 || self.0.packing.swap(true, Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let raw = self.0.raw.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(pixels) = raw else {
+            return Ok(None);
+        };
+        match write_spill(&pixels, dir, stem) {
+            Ok(path) => {
+                let _ = self.0.file.set(path.clone());
+                // `get` reads the file from here on.
+                *self.0.raw.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                Ok(Some(path))
+            }
+            Err(e) => {
+                self.0.packing.store(false, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
 }
+/// `pixels` as the file [`SpritePixels::spill`] names, in `dir`: written aside
+/// and renamed, so no reader sees half a file.
+fn write_spill(pixels: &[u8], dir: &Path, stem: &str) -> io::Result<PathBuf> {
+    let key = crate::astc::content_key(pixels);
+    let name = format!("{SPILL_PREFIX}{stem}-{key:016x}.rgba");
+    let path = dir.join(&name);
+    if fs::metadata(&path).is_ok_and(|m| m.len() == pixels.len() as u64) {
+        return Ok(path);
+    }
+    fs::create_dir_all(dir)?;
+    let part = dir.join(format!("{name}.{}.part", std::process::id()));
+    if let Err(e) = fs::write(&part, pixels).and_then(|()| fs::rename(&part, &path)) {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
+    for entry in fs::read_dir(dir)?.flatten() {
+        let other = entry.file_name();
+        let other = other.to_string_lossy();
+        if other.starts_with(SPILL_PREFIX) && other.ends_with(".rgba") && *other != name {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(path)
+}
+/// The start of a [`SpritePixels`] file's name.
+const SPILL_PREFIX: &str = "sprite-pixels-";
 /// The last `RenderAssets::generation` handed out.
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn invalid(message: &str) -> io::Error {
@@ -419,8 +500,47 @@ impl RenderAssets {
 
 #[cfg(test)]
 mod tests {
+    use super::SpritePixels;
     use crate::items::ConsumeEffect;
     use horizon_world::loot::PackOverlay;
+    use std::fs;
+
+    /// Spilled pixels read back as they were; the same bytes find their file
+    /// again; other textures replace an older spill; and bytes that cannot be
+    /// written stay in memory.
+    #[test]
+    fn spilled_sprite_pixels_come_back_from_their_file() {
+        let dir = std::env::temp_dir().join(format!("hz-sprite-spill-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let first = SpritePixels::new(bytes.clone());
+        let path = first.spill(&dir, "16-4l").unwrap().expect("spilled");
+        assert!(
+            first.spill(&dir, "16-4l").unwrap().is_none(),
+            "spilled already"
+        );
+        assert_eq!(*first.get(), bytes);
+        assert_eq!(first.len(), bytes.len());
+
+        let again = SpritePixels::new(bytes.clone());
+        assert_eq!(again.spill(&dir, "16-4l").unwrap(), Some(path.clone()));
+
+        let other = SpritePixels::new(vec![7; 4096]);
+        let other_path = other.spill(&dir, "16-4l").unwrap().expect("spilled");
+        assert_ne!(other_path, path);
+        assert!(
+            other_path.exists() && !path.exists(),
+            "the older spill goes"
+        );
+        assert_eq!(*other.get(), vec![7; 4096]);
+
+        let not_a_dir = dir.join("file");
+        fs::write(&not_a_dir, b"x").unwrap();
+        let kept = SpritePixels::new(vec![1; 64]);
+        assert!(kept.spill(&not_a_dir, "16-4l").is_err());
+        assert_eq!(*kept.get(), vec![1; 64]);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn always_edible_and_consume_effects_loaded() {

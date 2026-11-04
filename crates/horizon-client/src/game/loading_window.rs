@@ -22,6 +22,39 @@ pub(super) fn prepare_renderer_textures(
     )
 }
 
+/// The renderer has the block sprites on the GPU now: move their pixels to the
+/// cache folder, beside the GUI atlas's spill, and drop the CPU copy. Hashing
+/// and writing 20 MiB to a handheld's card must not hold the first frames
+/// back, so it runs on a thread of its own, which ends when it is done.
+fn spill_sprite_pixels(pack: &PackResources) {
+    let render = pack.render.clone();
+    let Ok(dir) = std::env::current_dir() else {
+        return;
+    };
+    if render.pixels.is_empty() {
+        return;
+    }
+    let dir = dir.join("cache");
+    let stem = format!("{}-{}l", render.sprite_size, render.texture_layers);
+    let spawned = std::thread::Builder::new()
+        .name("sprite spill".into())
+        .spawn(move || match render.pixels.spill(&dir, &stem) {
+            Ok(Some(path)) => {
+                horizon_threads::release_free_memory();
+                log::info!(
+                    "Horizon: block sprite pixels spilled to {} and their CPU copy dropped, rss {} MiB",
+                    path.display(),
+                    rss_mib()
+                );
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("Horizon: block sprite pixels kept in memory: {e}"),
+        });
+    if let Err(e) = spawned {
+        log::warn!("Horizon: block sprite pixels kept in memory: {e}");
+    }
+}
+
 /// Upload pack textures and create the renderer on the window's device.
 pub(super) fn build_renderer(
     window: Arc<Window>,
@@ -87,6 +120,7 @@ pub(super) fn build_renderer(
         shader_pack.frame(),
         display,
     ))?;
+    spill_sprite_pixels(pack);
     horizon_threads::release_free_memory();
     log::info!(
         "Horizon: renderer built in {} ms, rss {} MiB",
