@@ -15,10 +15,10 @@ use crate::sound_events::{Sound, SoundRegistry};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use horizon_core::random::{LegacyRandom, RandomSource};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 /// An OpenAL source's state.
@@ -29,9 +29,40 @@ enum State {
     Paused,
     Stopped,
 }
+/// What a source plays: a whole decoded sound (`SoundBuffer`), or a streamed
+/// sound's queue (an `AudioStream` behind OpenAL's queued buffers).
+#[derive(Clone)]
+enum Source {
+    Whole(Arc<Vec<f32>>),
+    Streamed(Arc<Streamed>),
+}
+/// A streamed sound (`stream: true`: music, records), decoded only a little
+/// ahead of the mixer: vanilla's `Channel.attachBufferStream` queues
+/// `QUEUED_BUFFER_COUNT` buffers of `BUFFER_DURATION_SECONDS` each and refills
+/// them as they play. Decoded whole, a track held all of its samples while it
+/// played: 26.3's median music track is 53 MiB of them, `the_end` 152 MiB.
+#[derive(Default)]
+struct Streamed {
+    queue: Mutex<StreamQueue>,
+    /// Signalled when the mixer has played some of the queue.
+    room: Condvar,
+}
+#[derive(Default)]
+struct StreamQueue {
+    /// Interleaved, as a whole sound's.
+    samples: VecDeque<f32>,
+    /// Which frame of the sound `samples` starts at (counted on through a
+    /// looping stream's restarts).
+    first: u64,
+    /// The decoder has queued the last sample: running out is the end.
+    done: bool,
+}
+/// `Channel.QUEUED_BUFFER_COUNT` x `Channel.BUFFER_DURATION_SECONDS`: the
+/// seconds of a streamed sound decoded ahead of what plays.
+const STREAM_SECONDS_AHEAD: usize = 4;
 /// An OpenAL source.
 struct Channel {
-    samples: Option<(Arc<Vec<f32>>, u32, u16)>,
+    samples: Option<(Source, u32, u16)>,
     position: f64,
     state: State,
     gain: f32,
@@ -414,6 +445,10 @@ impl SoundCache {
             .map_or(0, |(s, _, _)| s.len() * std::mem::size_of::<f32>())
     }
 }
+/// A cached whole sound as a source.
+fn whole(samples: Samples) -> Option<(Source, u32, u16)> {
+    samples.map(|(samples, rate, channels)| (Source::Whole(samples), rate, channels))
+}
 /// A static sound to decode for a channel waiting on it.
 struct Decode {
     key: String,
@@ -424,7 +459,12 @@ struct Decode {
 /// Give a channel waiting on its sound the decoded samples and start it, as
 /// the buffer future attaching and playing the source. A source stopped or
 /// released meanwhile stays so.
-fn attach(mixer: &Mutex<Mixer>, channel: ChannelId, samples: Samples, looping: bool) {
+fn attach(
+    mixer: &Mutex<Mixer>,
+    channel: ChannelId,
+    samples: Option<(Source, u32, u16)>,
+    looping: bool,
+) {
     if let Some(samples) = samples
         && let Ok(mut m) = mixer.lock()
         && let Some(c) = m.channels.get_mut(&channel)
@@ -549,68 +589,191 @@ fn probe_devices(default_seen: Option<String>, cards_seen: Option<String>) -> De
         devices,
     }
 }
-fn decode(path: &Path) -> Option<(Vec<f32>, u32, u16)> {
-    use symphonia::core::{
-        audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
-        meta::MetadataOptions, probe::Hint,
-    };
-    let file = fs::File::open(path).ok()?;
-    let stream = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    hint.with_extension("ogg");
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            stream,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .ok()?;
-    let mut format = probed.format;
-    let track = format.default_track()?;
-    let id = track.id;
-    let rate = track.codec_params.sample_rate?;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .ok()?;
-    let mut samples = Vec::new();
-    let mut channels = 0u16;
-    while let Ok(packet) = format.next_packet() {
-        if packet.track_id() != id {
-            continue;
-        }
-        let Ok(buffer) = decoder.decode(&packet) else {
-            continue;
+/// An Ogg/Vorbis file being decoded, a packet at a time, into interleaved
+/// samples of at most two channels.
+struct Decoding {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    track: u32,
+    rate: u32,
+    /// The samples' channel count, from the first packet (0 before it).
+    channels: u16,
+}
+impl Decoding {
+    fn open(path: &Path) -> Option<Self> {
+        use symphonia::core::{
+            codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
+            meta::MetadataOptions, probe::Hint,
         };
-        let spec = *buffer.spec();
-        let frame_channels = spec.channels.count().max(1);
-        let mut decoded = SampleBuffer::<f32>::new(buffer.capacity() as u64, spec);
-        decoded.copy_interleaved_ref(buffer);
-        if channels == 0 {
-            channels = frame_channels.min(2) as u16;
-        }
-        if frame_channels <= 2 {
-            samples.extend_from_slice(decoded.samples());
-        } else {
-            // OpenAL plays multi-channel buffers direct; a stereo output hears the odd/even split.
-            for frame in decoded.samples().chunks(frame_channels) {
-                let (mut left, mut right) = (0.0, 0.0);
-                let (mut lefts, mut rights) = (0.0f32, 0.0f32);
-                for (i, sample) in frame.iter().enumerate() {
-                    if i % 2 == 0 {
-                        left += sample;
-                        lefts += 1.0;
-                    } else {
-                        right += sample;
-                        rights += 1.0;
-                    }
-                }
-                samples.push(left / lefts.max(1.0));
-                samples.push(right / rights.max(1.0));
+        let file = fs::File::open(path).ok()?;
+        let stream = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("ogg");
+        let probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                stream,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .ok()?;
+        let format = probed.format;
+        let track = format.default_track()?;
+        let (id, rate) = (track.id, track.codec_params.sample_rate?);
+        let decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .ok()?;
+        Some(Self {
+            format,
+            decoder,
+            track: id,
+            rate,
+            channels: 0,
+        })
+    }
+    /// Append the next packet's samples to `samples`; `false` at the end.
+    fn next(&mut self, samples: &mut Vec<f32>) -> bool {
+        use symphonia::core::audio::SampleBuffer;
+        while let Ok(packet) = self.format.next_packet() {
+            if packet.track_id() != self.track {
+                continue;
             }
+            let Ok(buffer) = self.decoder.decode(&packet) else {
+                continue;
+            };
+            let spec = *buffer.spec();
+            let frame_channels = spec.channels.count().max(1);
+            let mut decoded = SampleBuffer::<f32>::new(buffer.capacity() as u64, spec);
+            decoded.copy_interleaved_ref(buffer);
+            if self.channels == 0 {
+                self.channels = frame_channels.min(2) as u16;
+            }
+            if frame_channels <= 2 {
+                samples.extend_from_slice(decoded.samples());
+            } else {
+                // OpenAL plays multi-channel buffers direct; a stereo output hears the odd/even split.
+                for frame in decoded.samples().chunks(frame_channels) {
+                    let (mut left, mut right) = (0.0, 0.0);
+                    let (mut lefts, mut rights) = (0.0f32, 0.0f32);
+                    for (i, sample) in frame.iter().enumerate() {
+                        if i % 2 == 0 {
+                            left += sample;
+                            lefts += 1.0;
+                        } else {
+                            right += sample;
+                            rights += 1.0;
+                        }
+                    }
+                    samples.push(left / lefts.max(1.0));
+                    samples.push(right / rights.max(1.0));
+                }
+            }
+            return true;
+        }
+        false
+    }
+}
+/// A whole sound, for the cache: trimmed to its samples, since a vector grown
+/// by doubling holds up to twice what `SoundCache` counts.
+fn decode(path: &Path) -> Option<(Vec<f32>, u32, u16)> {
+    let mut decoding = Decoding::open(path)?;
+    let mut samples = Vec::new();
+    while decoding.next(&mut samples) {}
+    samples.shrink_to_fit();
+    let (rate, channels) = (decoding.rate, decoding.channels);
+    (channels != 0).then_some((samples, rate, channels))
+}
+/// Play a streamed sound on `channel`: decode it on this thread, start the
+/// channel once `STREAM_SECONDS_AHEAD` are queued, as vanilla's
+/// `attachBufferStream` pumps its buffers before `play`, and keep the queue
+/// that far ahead until the file ends, or, while the channel loops, from its
+/// start again (a streamed sound loops by restarting its stream). A file that
+/// cannot load leaves the source initial.
+fn stream(file: &Path, mixer: &Mutex<Mixer>, channel: ChannelId, looping: bool) {
+    let Some(mut decoding) = Decoding::open(file) else {
+        return;
+    };
+    // The first packet gives the channel count; a file without one has not
+    // loaded, as in `decode`.
+    let mut first = Vec::new();
+    if !decoding.next(&mut first) {
+        return;
+    }
+    let (rate, channels) = (decoding.rate, decoding.channels);
+    let mut first = Some(first);
+    let stream = Arc::new(Streamed::default());
+    let source = Source::Streamed(stream.clone());
+    // Nothing decoded since the file was opened: an empty file never loops.
+    let mut fresh = false;
+    let next = |packet: &mut Vec<f32>| loop {
+        if let Some(first) = first.take() {
+            packet.extend(first);
+            return true;
+        }
+        if decoding.next(packet) {
+            fresh = false;
+            return true;
+        }
+        let again = !fresh
+            && (looping
+                || mixer
+                    .lock()
+                    .is_ok_and(|m| m.channels.get(&channel).is_some_and(|c| c.looping)));
+        match again.then(|| Decoding::open(file)).flatten() {
+            Some(reopened) => {
+                decoding = reopened;
+                fresh = true;
+            }
+            None => return false,
+        }
+    };
+    let ahead = rate as usize * usize::from(channels) * STREAM_SECONDS_AHEAD;
+    pump(&stream, ahead, next, || {
+        attach(mixer, channel, Some((source, rate, channels)), looping);
+    });
+}
+/// Fill `stream`'s queue from `next` (one packet's samples appended, `false`
+/// at the end), never more than a packet past `ahead` samples in front of the
+/// mixer, and call `ready` once it first holds `ahead` (or the whole sound).
+/// Returns at the end, or when nothing else holds the stream any more (the
+/// channel was released, or never took it).
+fn pump(
+    stream: &Arc<Streamed>,
+    ahead: usize,
+    mut next: impl FnMut(&mut Vec<f32>) -> bool,
+    ready: impl FnOnce(),
+) {
+    let mut ready = Some(ready);
+    let mut packet = Vec::new();
+    loop {
+        packet.clear();
+        let more = next(&mut packet);
+        let Ok(mut queue) = stream.queue.lock() else {
+            return;
+        };
+        while more && queue.samples.len() >= ahead {
+            if Arc::strong_count(stream) == 1 {
+                return;
+            }
+            queue = match stream
+                .room
+                .wait_timeout(queue, std::time::Duration::from_millis(250))
+            {
+                Ok((queue, _)) => queue,
+                Err(_) => return,
+            };
+        }
+        queue.samples.extend(&packet);
+        queue.done = !more;
+        let full = !more || queue.samples.len() >= ahead;
+        drop(queue);
+        if full && let Some(ready) = ready.take() {
+            ready();
+        }
+        if !more {
+            return;
         }
     }
-    (channels != 0).then_some((samples, rate, channels))
 }
 /// A sound file without its variant number (`mob/creeper/say2.ogg` is `mob/creeper/say`): each
 /// player's game picks its own variant of the same event.
@@ -761,18 +924,16 @@ impl Backend for MixerBackend {
             return;
         }
         if sound.stream {
-            // A streamed sound loops by restarting its stream.
             let mixer = self.mixer.clone();
-            std::thread::spawn(move || {
-                let samples = decode(&file).map(|(s, r, c)| (Arc::new(s), r, c));
-                attach(&mixer, channel, samples, looping);
-            });
+            let _ = std::thread::Builder::new()
+                .name("sound stream".into())
+                .spawn(move || stream(&file, &mixer, channel, looping));
             return;
         }
         let key = format!("{namespace}:{path}");
         let cached = self.cache.lock().ok().and_then(|mut c| c.get(&key));
         if let Some(samples) = cached {
-            attach(&self.mixer, channel, samples, looping);
+            attach(&self.mixer, channel, whole(samples), looping);
             return;
         }
         let decoder = self.decoder.get_or_insert_with(|| {
@@ -791,7 +952,7 @@ impl Backend for MixerBackend {
                             }
                             samples
                         });
-                        attach(&mixer, job.channel, samples, job.looping);
+                        attach(&mixer, job.channel, whole(samples), job.looping);
                     }
                 })
                 .expect("sound decoder thread");
@@ -1005,10 +1166,23 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
         let Some(c) = mixer.channels.get_mut(&id) else {
             continue;
         };
-        let Some((samples, _, source_channels)) = c.samples.clone() else {
+        let Some((source, _, source_channels)) = c.samples.clone() else {
             continue;
         };
         let source_channels = source_channels as usize;
+        let samples = match source {
+            Source::Whole(samples) => samples,
+            Source::Streamed(stream) => {
+                let out: &mut [f32] = if muffling && !c.unmuffled {
+                    &mut bus
+                } else {
+                    &mut *data
+                };
+                let gains = [left, right, gain];
+                mix_streamed(c, &stream, source_channels, out, channels, gains, step);
+                continue;
+            }
+        };
         let frames = samples.len() / source_channels;
         let inaudible = if channels >= 2 {
             left == 0.0 && right == 0.0
@@ -1162,6 +1336,65 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
         }
         mixer.limiter_peak = (mixer.limiter_peak * release).max(peak);
     }
+}
+/// One voice of a streamed sound: `mix`'s loop over a whole sound, read from
+/// the queue, whose played samples are then dropped and the decoder woken to
+/// refill it. A queue the decoder has not caught up with plays nothing and
+/// holds the position, as an OpenAL source out of buffers; running out after
+/// the last sample is the end.
+fn mix_streamed(
+    c: &mut Channel,
+    stream: &Streamed,
+    source_channels: usize,
+    out: &mut [f32],
+    channels: usize,
+    [left, right, gain]: [f32; 3],
+    step: f64,
+) {
+    // The decoder holds the lock only to append a packet, so waiting for it
+    // costs the callback microseconds; skipping the voice instead would drop a
+    // buffer of the sound.
+    let Ok(mut queue) = stream.queue.lock() else {
+        return;
+    };
+    let frames = queue.samples.len() / source_channels;
+    for frame in out.chunks_mut(channels) {
+        let i = c.position as u64;
+        let at = i.saturating_sub(queue.first) as usize;
+        if at + 1 >= frames {
+            if queue.done {
+                c.state = State::Stopped;
+            }
+            break;
+        }
+        let t = (c.position - i as f64) as f32;
+        let samples = &queue.samples;
+        if source_channels > 1 {
+            let (a, b) = (at * 2, (at + 1) * 2);
+            let l = samples[a] + (samples[b] - samples[a]) * t;
+            let r = samples[a + 1] + (samples[b + 1] - samples[a + 1]) * t;
+            if channels >= 2 {
+                frame[0] += l * left;
+                frame[1] += r * right;
+            } else {
+                frame[0] += (l + r) * 0.5 * gain;
+            }
+        } else {
+            let s = samples[at] + (samples[at + 1] - samples[at]) * t;
+            if channels >= 2 {
+                frame[0] += s * left;
+                frame[1] += s * right;
+            } else {
+                frame[0] += s * gain;
+            }
+        }
+        c.position += step;
+    }
+    let played = ((c.position as u64).saturating_sub(queue.first) as usize).min(frames);
+    queue.samples.drain(..played * source_channels);
+    queue.first += played as u64;
+    drop(queue);
+    stream.room.notify_one();
 }
 /// Why the game should not open an output, if it should not:
 /// `HORIZON_NO_AUDIO`, or a virtual screen (`vscreen`), where agents and
@@ -2378,7 +2611,7 @@ mod tests {
 
     fn channel(samples: Vec<f32>, linear: Option<f32>, at: [f32; 3], looping: bool) -> Channel {
         Channel {
-            samples: Some((Arc::new(samples), 48_000, 1)),
+            samples: Some((Source::Whole(Arc::new(samples)), 48_000, 1)),
             position: 0.0,
             state: State::Playing,
             gain: 1.0,
@@ -2402,7 +2635,7 @@ mod tests {
         looping: bool,
     ) -> Channel {
         let mut c = channel(Vec::new(), linear, at, looping);
-        c.samples = Some((Arc::new(samples), 48_000, 2));
+        c.samples = Some((Source::Whole(Arc::new(samples)), 48_000, 2));
         c
     }
 
@@ -2425,6 +2658,95 @@ mod tests {
         // A failed load is remembered without counting.
         cache.insert("missing".into(), None);
         assert_eq!(cache.get("missing"), Some(None));
+    }
+    /// A streamed sound, mono or stereo, plays sample for sample as the same
+    /// sound decoded whole, and its decoder never runs more than a packet past
+    /// `ahead`.
+    #[test]
+    fn a_streamed_sound_plays_as_the_whole_sound_with_a_bounded_queue() {
+        let wave: Vec<f32> = (0..20_000).map(|i| (i % 97) as f32 / 48.0 - 1.0).collect();
+        let (ahead, packet) = (3_000, 700);
+        for source_channels in [1, 2] {
+            let mut whole = Mixer::default();
+            let mut c = channel(Vec::new(), None, [0.0, 0.0, -1.0], false);
+            c.samples = Some((
+                Source::Whole(Arc::new(wave.clone())),
+                48_000,
+                source_channels,
+            ));
+            whole.channels.insert(1, c);
+            let stream = Arc::new(Streamed::default());
+            let mut streamed = Mixer::default();
+            let mut c = channel(Vec::new(), None, [0.0, 0.0, -1.0], false);
+            c.samples = Some((Source::Streamed(stream.clone()), 48_000, source_channels));
+            streamed.channels.insert(1, c);
+            let (ready_send, ready) = std::sync::mpsc::channel();
+            let decoder = {
+                let (stream, wave) = (stream.clone(), wave.clone());
+                std::thread::spawn(move || {
+                    let mut packets = wave.chunks(packet);
+                    let next = |out: &mut Vec<f32>| {
+                        packets.next().map(|p| out.extend_from_slice(p)).is_some()
+                    };
+                    pump(&stream, ahead, next, move || ready_send.send(()).unwrap());
+                })
+            };
+            ready.recv().unwrap();
+            let frames = 256;
+            let (mut a, mut b) = (vec![0.0f32; 2 * frames], vec![0.0f32; 2 * frames]);
+            while whole.channels[&1].state == State::Playing {
+                // Mix once the decoder has this buffer's samples queued, as the
+                // device would after its period; meanwhile the queue stays bounded.
+                let position = streamed.channels[&1].position as u64;
+                loop {
+                    let queue = stream.queue.lock().unwrap();
+                    assert!(
+                        queue.samples.len() <= ahead + packet,
+                        "{}",
+                        queue.samples.len()
+                    );
+                    let queued = (queue.samples.len() / usize::from(source_channels)) as u64;
+                    if queue.done || queue.first + queued > position + frames as u64 + 1 {
+                        break;
+                    }
+                    drop(queue);
+                    std::thread::yield_now();
+                }
+                mix(&mut whole, &mut a, 2, 48_000);
+                mix(&mut streamed, &mut b, 2, 48_000);
+                assert_eq!(a, b);
+            }
+            assert_eq!(streamed.channels[&1].state, State::Stopped);
+            decoder.join().unwrap();
+        }
+    }
+    /// A stream whose channel let go of it (released, or stopped before it
+    /// started) stops decoding instead of waiting on the mixer for ever.
+    #[test]
+    fn a_stream_nobody_plays_stops_decoding() {
+        let (done_send, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stream = Arc::new(Streamed::default());
+            let mut packets = 0;
+            pump(
+                &stream,
+                1_000,
+                |out| {
+                    packets += 1;
+                    out.extend([0.5; 100]);
+                    true
+                },
+                || {},
+            );
+            done_send.send(packets).unwrap();
+        });
+        let packets = done
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the decoder returned");
+        assert!(
+            packets <= 11,
+            "decoded {packets} packets for a 10-packet queue"
+        );
     }
     #[test]
     fn output_stays_off_on_a_virtual_screen_unless_asked() {
