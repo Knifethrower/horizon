@@ -14,6 +14,36 @@
 // other sampler's branch.
 @group(0) @binding(2) var nearest_sampler: sampler;
 @group(0) @binding(4) var linear_sampler: sampler;
+// The shared atlas is two textures (gfx/shared_atlas.rs): `atlas` holds its
+// static rows and `atlas_dynamic` the rows below them, which the game writes
+// while it runs. Atlas coordinates address both as one atlas as tall as both.
+@group(0) @binding(8) var atlas_dynamic: texture_2d<f32>;
+// Both parts' texels across, and down together.
+fn atlas_size() -> vec2<u32> {
+    return vec2(textureDimensions(atlas).x, textureDimensions(atlas).y + textureDimensions(atlas_dynamic).y);
+}
+// The atlas at `uv` through `nearest_sampler`. It has one level, so the explicit
+// level 0 is what an implicit sample read, and it is valid in any control flow.
+fn atlas_nearest(uv: vec2<f32>) -> vec4<f32> {
+    let upper = f32(textureDimensions(atlas).y);
+    let lower = f32(textureDimensions(atlas_dynamic).y);
+    let row = uv.y * (upper + lower);
+    if row < upper {
+        return textureSampleLevel(atlas, nearest_sampler, vec2(uv.x, row / upper), 0.0);
+    }
+    return textureSampleLevel(atlas_dynamic, nearest_sampler, vec2(uv.x, (row - upper) / lower), 0.0);
+}
+// The atlas at `uv` through `linear_sampler`. It has one level, so the explicit
+// level 0 is what an implicit sample read, and it is valid in any control flow.
+fn atlas_linear(uv: vec2<f32>) -> vec4<f32> {
+    let upper = f32(textureDimensions(atlas).y);
+    let lower = f32(textureDimensions(atlas_dynamic).y);
+    let row = uv.y * (upper + lower);
+    if row < upper {
+        return textureSampleLevel(atlas, linear_sampler, vec2(uv.x, row / upper), 0.0);
+    }
+    return textureSampleLevel(atlas_dynamic, linear_sampler, vec2(uv.x, (row - upper) / lower), 0.0);
+}
 override CLAMP: bool = false;
 struct Out {
     @builtin(position) clip: vec4<f32>,
@@ -30,7 +60,7 @@ struct Out {
     out.uv = uv;
     out.rect = rect;
     out.color = color;
-    let half = 0.5 / vec2<f32>(textureDimensions(atlas));
+    let half = 0.5 / vec2<f32>(atlas_size());
     out.edges = vec4(rect.xy + half, rect.zw - half);
     return out;
 }
@@ -52,18 +82,18 @@ fn screen(c: vec4<f32>) -> vec4<f32> {
     return c;
 }
 @fragment fn fs_screen(in: Out) -> @location(0) vec4<f32> {
-    return screen(textureSampleLevel(atlas, nearest_sampler, atlas_uv(in), 0.0) * in.color);
+    return screen(atlas_nearest(atlas_uv(in)) * in.color);
 }
 @fragment fn fs_screen_blur(in: Out) -> @location(0) vec4<f32> {
-    return screen(textureSampleLevel(atlas, linear_sampler, atlas_uv(in), 0.0) * in.color);
+    return screen(atlas_linear(atlas_uv(in)) * in.color);
 }
 // RenderPipelines.VIGNETTE blends ZERO, ONE_MINUS_SRC_COLOR: output the
 // texture colour; the blend state darkens the frame by it.
 @fragment fn fs_vignette(in: Out) -> @location(0) vec4<f32> {
-    let c = textureSampleLevel(atlas, nearest_sampler, atlas_uv(in), 0.0) * in.color;
+    let c = atlas_nearest(atlas_uv(in)) * in.color;
     return vec4(c.rgb, 1.0);
 }
 @fragment fn fs_vignette_blur(in: Out) -> @location(0) vec4<f32> {
-    let c = textureSampleLevel(atlas, linear_sampler, atlas_uv(in), 0.0) * in.color;
+    let c = atlas_linear(atlas_uv(in)) * in.color;
     return vec4(c.rgb, 1.0);
 }

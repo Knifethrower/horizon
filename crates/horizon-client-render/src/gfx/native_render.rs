@@ -37,7 +37,8 @@ pub struct WorldDrawn<'a> {
     /// ([`RenderNeeds::entity_spans`]) or a shader pack draws them.
     pub entities: &'a [Vertex],
     pub spans: &'a [EntitySpan],
-    /// The shared atlas entity UVs point into.
+    /// The shared atlas entity UVs point into, as one texture, when a mod asked
+    /// for it ([`RenderNeeds::atlas`]).
     pub atlas: Option<&'a wgpu::Texture>,
     /// Quad indices (0 1 2 0 2 3 for each 4 vertices), for as many quads as `entities` holds.
     pub quad_indices: &'a wgpu::Buffer,
@@ -52,6 +53,10 @@ pub struct RenderNeeds {
     pub entity_spans: bool,
     /// Keep the world pass's depth for [`native_world_drawn`] when nothing else does.
     pub world_depth: bool,
+    /// Pass the shared atlas as one texture in [`WorldDrawn::atlas`]. The game
+    /// keeps its static and dynamic rows in two textures, so this makes a whole
+    /// copy (the memory the split saves) the first time a mod asks.
+    pub atlas: bool,
 }
 
 /// The world is drawn (see [`WorldDrawn`]). Not called on the title screen's panorama.

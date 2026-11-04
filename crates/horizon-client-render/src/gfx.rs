@@ -116,6 +116,7 @@ mod page_runs;
 pub mod panorama;
 mod readback;
 mod resident;
+pub mod shared_atlas;
 mod stars;
 mod sunrise_fan;
 mod timing;
@@ -1544,7 +1545,8 @@ impl Renderer {
         layers: u32,
         sprite_mips: &[crate::mipmap::Settings],
         animations: &[SpriteAnimation],
-        hud_atlas: (&[u8], u32, u32),
+        // Pixels, width, height and static rows (`HudAtlas::static_rows`).
+        hud_atlas: (&[u8], u32, u32, u32),
         hud_atlas_file: Option<&std::path::Path>,
         glint: (&[u8], u32, u32),
         glint_armor: (&[u8], u32, u32),
@@ -2335,7 +2337,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (atlas_pixels, atlas_width, atlas_height) = hud_atlas;
+        let (atlas_pixels, atlas_width, atlas_height, atlas_static_rows) = hud_atlas;
         log::info!(
             "Horizon: shared atlas {atlas_width}x{atlas_height}, {} MiB",
             u64::from(atlas_width) * u64::from(atlas_height) * 4 / (1024 * 1024)
@@ -2351,29 +2353,20 @@ impl Renderer {
         // previous texture skips the upload and, where the GPU's memory counts
         // against the process (a 1 GB handheld's Mali), a second copy of it.
         let reused = previous
-            .and_then(|renderer| renderer.hud.atlas_texture.as_ref())
-            .filter(|texture| texture.width() == atlas_width && texture.height() == atlas_height);
-        // The baked ASTC copy of that spill, when `patch.bash` made one and
-        // this GPU samples it: a quarter of the bytes to read and to hold.
-        // Not the ASTC bake: the atlas takes run-time patches (font glyphs,
-        // skins, maps) as RGBA at arbitrary positions, and an ASTC texture can
-        // only be written in whole 4x4 blocks, which made the first patched
-        // frame fail with "Copy origin's x component is not a multiple of block
-        // width". Compressing it needs those mutable sprites in a texture of
-        // their own first; the bake stays beside the spill for that.
-        let baked: Option<wgpu::Texture> = None;
+            .and_then(|renderer| renderer.hud.atlas.as_ref())
+            .filter(|atlas| {
+                (atlas.width, atlas.height, atlas.static_rows)
+                    == (atlas_width, atlas_height, atlas_static_rows)
+            });
+        // The atlas is two textures (`shared_atlas`): the static rows, packed
+        // once, and the rows the game writes while it runs (font glyphs, skins,
+        // maps), which take RGBA at arbitrary positions.
         let atlas = match reused {
-            Some(texture) => {
+            Some(atlas) => {
                 log::info!(
                     "Horizon: shared atlas {atlas_width}x{atlas_height} reused from the previous renderer"
                 );
-                texture.clone()
-            }
-            None if baked.is_some() => {
-                log::info!(
-                    "Horizon: shared atlas {atlas_width}x{atlas_height} loaded from its ASTC bake"
-                );
-                baked.expect("checked just above")
+                atlas.clone()
             }
             None if atlas_pixels.is_empty() => {
                 // The caller spilled the CPU atlas to the game folder and
@@ -2387,22 +2380,12 @@ impl Renderer {
                     );
                 };
                 use std::io::{Read as _, Seek as _, SeekFrom};
-                let atlas = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Shared atlas"),
-                    size: wgpu::Extent3d {
-                        width: atlas_width,
-                        height: atlas_height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
+                let atlas = shared_atlas::SharedAtlas::new(
+                    &device,
+                    atlas_width,
+                    atlas_height,
+                    atlas_static_rows,
+                );
                 let started = std::time::Instant::now();
                 let bytes_per_row = atlas_width * 4;
                 let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
@@ -2417,25 +2400,7 @@ impl Renderer {
                     file.seek(SeekFrom::Start(u64::from(y) * u64::from(bytes_per_row)))
                         .map_err(|e| e.to_string())?;
                     file.read_exact(&mut buf[..len]).map_err(|e| e.to_string())?;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &atlas,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d { x: 0, y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &buf[..len],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bytes_per_row),
-                            rows_per_image: Some(height),
-                        },
-                        wgpu::Extent3d {
-                            width: atlas_width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
+                    atlas.write_rows(&queue, y, &buf[..len]);
                     queue.submit([]);
                     y += height;
                 }
@@ -2447,23 +2412,12 @@ impl Renderer {
                 atlas
             }
             None => {
-                let atlas = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Shared atlas"),
-                    size: wgpu::Extent3d {
-                        width: atlas_width,
-                        height: atlas_height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    // COPY_SRC: a shader pack's weather copies the rain and snow sprites out.
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
+                let atlas = shared_atlas::SharedAtlas::new(
+                    &device,
+                    atlas_width,
+                    atlas_height,
+                    atlas_static_rows,
+                );
                 // `create_texture_with_data` stages the whole atlas (80 MiB on
                 // the default resources) in one buffer, which lands beside the
                 // packed CPU atlas at the peak of a 1 GB handheld. Upload in
@@ -2476,25 +2430,7 @@ impl Renderer {
                     let height = rows.min(atlas_height - y);
                     let start = (y * bytes_per_row) as usize;
                     let end = start + (height * bytes_per_row) as usize;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &atlas,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d { x: 0, y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &atlas_pixels[start..end],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bytes_per_row),
-                            rows_per_image: Some(height),
-                        },
-                        wgpu::Extent3d {
-                            width: atlas_width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
+                    atlas.write_rows(&queue, y, &atlas_pixels[start..end]);
                     queue.submit([]);
                     y += height;
                 }
@@ -2505,7 +2441,8 @@ impl Renderer {
                 atlas
             }
         };
-        let atlas_view = atlas.create_view(&Default::default());
+        let atlas_view = atlas.static_view.clone();
+        let atlas_dynamic_view = atlas.dynamic_view.clone();
         // vanilla's `GlintSampler`: enchanted_glint_item as its own texture,
         // repeated per pixel (`clamp: false`), linear without mipmaps
         // (`blur: true`).
@@ -2564,11 +2501,11 @@ impl Renderer {
         let mut hud = HudRenderer::new(
             &device,
             config.format.remove_srgb_suffix(),
-            &atlas_view,
+            [&atlas_view, &atlas_dynamic_view],
             &glint_view,
             &glint_sampler,
         )?;
-        hud.atlas_texture = Some(atlas.clone());
+        hud.atlas = Some(atlas);
         let entity_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon entities"),
             source: wgpu::ShaderSource::Wgsl(entity_shader().into()),
@@ -2636,6 +2573,16 @@ impl Renderer {
                         multisampled: false,
                     },
                 ),
+                // The shared atlas's dynamic rows (binding 1 has its static rows).
+                entry(
+                    8,
+                    vf,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
             ],
         });
         let weather = weather::Weather::new(
@@ -2684,6 +2631,10 @@ impl Renderer {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&glint_armor_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&atlas_dynamic_view),
+                },
             ],
         });
         let hand_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2721,6 +2672,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&glint_armor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&atlas_dynamic_view),
                 },
             ],
         });
@@ -4535,6 +4490,17 @@ impl Renderer {
         };
         let buffers = [Some(vertex), Some(instances)];
         let flat = self.pack_terrain_flat;
+        // The pack's programs sample the shared atlas (sky, entities,
+        // particles, hand) as one texture: they get it whole.
+        let celestial = pack.as_ref().and_then(|_| {
+            let atlas = self.hud.atlas.as_mut()?;
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            let view = atlas
+                .combined(&self.device, &mut encoder)
+                .create_view(&Default::default());
+            self.queue.submit([encoder.finish()]);
+            Some(view)
+        });
         let post = pack.map(|post| {
             let world = pack_post::World {
                 atlas: self.pack_atlas.as_ref().map(|a| (a.view.clone(), a.size())),
@@ -4548,11 +4514,7 @@ impl Renderer {
                     cull: true,
                 }),
                 block_ids,
-                celestial: self
-                    .hud
-                    .atlas_texture
-                    .as_ref()
-                    .map(|t| t.create_view(&Default::default())),
+                celestial,
                 clouds: Some(&self.cloud_bindings),
                 weather: true,
                 hand: true,
@@ -7098,19 +7060,23 @@ impl Renderer {
             && let Some((dimension, Some(mut post))) = self.pack_post.take()
         {
             let size = self.world_post.size().unwrap_or([1, 1]);
-            let weather = match &self.hud.atlas_texture {
-                Some(atlas) if pack_draws_weather => self
-                    .pack_weather
-                    .get_or_insert_with(|| pack_weather::PackWeather::new(&self.device))
-                    .prepare(
-                        &self.device,
-                        &mut encoder,
-                        &mut self.uploads,
-                        atlas,
-                        frame.weather,
-                        frame.weather_time,
-                        &self.indices,
-                    ),
+            // The rain and snow sprites are copied out of the whole atlas
+            // (made when the pack was set).
+            let weather = match self.hud.atlas.as_mut() {
+                Some(atlas) if pack_draws_weather => {
+                    let atlas = atlas.combined(&self.device, &mut encoder).clone();
+                    self.pack_weather
+                        .get_or_insert_with(|| pack_weather::PackWeather::new(&self.device))
+                        .prepare(
+                            &self.device,
+                            &mut encoder,
+                            &mut self.uploads,
+                            &atlas,
+                            frame.weather,
+                            frame.weather_time,
+                            &self.indices,
+                        )
+                }
                 _ => None,
             };
             post.set_weather(weather);
@@ -7223,6 +7189,15 @@ impl Renderer {
                 .finish(&self.queue, &mut encoder, &view_target);
         }
         if !frame.title {
+            // A mod that samples the shared atlas gets it whole (`RenderNeeds::atlas`).
+            let mod_atlas = if native_render::render_needs().atlas {
+                self.hud
+                    .atlas
+                    .as_mut()
+                    .map(|atlas| atlas.combined(&self.device, &mut encoder).clone())
+            } else {
+                None
+            };
             let (depth, depth_size) = match &scaled {
                 Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
                 None => (&self.depth, size),
@@ -7242,7 +7217,7 @@ impl Renderer {
                 camera: frame.camera,
                 entities: frame.entities,
                 spans: frame.entity_spans,
-                atlas: self.hud.atlas_texture.as_ref(),
+                atlas: mod_atlas.as_ref(),
                 quad_indices: &self.indices,
             });
         }

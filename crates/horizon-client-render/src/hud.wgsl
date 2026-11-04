@@ -10,6 +10,25 @@ struct Hud {
 // enchanted_glint_item on its own repeating texture (vanilla's GlintSampler).
 @group(0) @binding(3) var glint_tex: texture_2d<f32>;
 @group(0) @binding(4) var glint_sampler: sampler;
+// The shared atlas is two textures (gfx/shared_atlas.rs): `atlas` holds its
+// static rows and `atlas_dynamic` the rows below them, which the game writes
+// while it runs. Atlas coordinates address both as one atlas as tall as both.
+@group(0) @binding(5) var atlas_dynamic: texture_2d<f32>;
+// Both parts' texels across, and down together.
+fn atlas_size() -> vec2<u32> {
+    return vec2(textureDimensions(atlas).x, textureDimensions(atlas).y + textureDimensions(atlas_dynamic).y);
+}
+// The atlas at `uv` through `atlas_sampler`. It has one level, so the explicit
+// level 0 is what an implicit sample read, and it is valid in any control flow.
+fn atlas_sample(uv: vec2<f32>) -> vec4<f32> {
+    let upper = f32(textureDimensions(atlas).y);
+    let lower = f32(textureDimensions(atlas_dynamic).y);
+    let row = uv.y * (upper + lower);
+    if row < upper {
+        return textureSampleLevel(atlas, atlas_sampler, vec2(uv.x, row / upper), 0.0);
+    }
+    return textureSampleLevel(atlas_dynamic, atlas_sampler, vec2(uv.x, (row - upper) / lower), 0.0);
+}
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -32,17 +51,17 @@ struct Out {
     // u >= 2: the GLINT_TEXTURING sample over the item, masked by the item's
     // texture alpha (item.fsh's ALPHA_CUTOUT and GLINT path).
     if in.uv.x >= 2.0 {
-        let mask = textureSample(atlas, atlas_sampler, in.uv - vec2(2.0, 0.0)).a;
+        let mask = atlas_sample(in.uv - vec2(2.0, 0.0)).a;
         if mask < 0.1 { discard; }
         let glint = hud.size.w * textureSample(glint_tex, glint_sampler, in.glint_uv);
         return vec4(glint.rgb * glint.rgb, mask);
     }
-    let c = textureSample(atlas, atlas_sampler, in.uv) * in.color;
+    let c = atlas_sample(in.uv) * in.color;
     if c.a < 0.004 { discard; }
     return c;
 }
 @fragment fn fs_crosshair(in: Out) -> @location(0) vec4<f32> {
-    let c = textureSample(atlas, atlas_sampler, in.uv) * in.color;
+    let c = atlas_sample(in.uv) * in.color;
     if c.a == 0.0 { discard; }
     return c;
 }
@@ -67,7 +86,7 @@ const PORTAL_COLORS = array<vec3<f32>, 16>(
 );
 fn portal_sample(rect: vec4<f32>, p: vec4<f32>) -> vec3<f32> {
     let st = fract(p.xy / p.w);
-    return textureSampleLevel(atlas, atlas_sampler, rect.xy + st * rect.zw, 0.0).rgb;
+    return atlas_sample(rect.xy + st * rect.zw).rgb;
 }
 fn portal_layer(p: vec4<f32>, layer: f32) -> vec4<f32> {
     let a = radians((layer * layer * 4321.0 + layer * 9.0) * 2.0);

@@ -18713,7 +18713,7 @@ fn build_renderer(
         assets.texture_layers,
         &assets.sprite_mips,
         &assets.animations,
-        (&atlas.pixels, atlas.width, atlas.height),
+        (&atlas.pixels, atlas.width, atlas.height, atlas.static_rows),
         gui.atlas_file.as_deref(),
         (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
         (
@@ -18740,9 +18740,11 @@ fn build_renderer(
         .iter()
         .map(|(rect, animation)| (*rect, animation.clone(), (usize::MAX, 0, 0)))
         .collect();
-    renderer
-        .hud
-        .set_text_shader(&renderer.device, atlas.text_shader.as_deref());
+    renderer.hud.set_text_shader(
+        &renderer.device,
+        &renderer.queue,
+        atlas.text_shader.as_deref(),
+    );
     Ok(renderer)
 }
 
@@ -18759,15 +18761,16 @@ fn loading_renderer(
     api: horizon_client::graphics::GraphicsApi,
 ) -> Result<Renderer> {
     static FORCEFIELD: [u8; 4] = [0; 4];
-    static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
+    // A row for each of the shared atlas's two parts (`gfx::shared_atlas`).
+    static EMPTY_HUD: [u8; 8] = [0, 0, 0, 255, 0, 0, 0, 255];
     static EMPTY_GLINT: [u8; 4] = [0; 4];
     let empty_panorama = horizon_client::gfx::panorama::Faces {
         size: 1,
         pixels: [0u8; 4].repeat(6),
     };
     let panorama = panorama.unwrap_or(&empty_panorama);
-    let (pixels, width, height) = atlas.map_or((EMPTY_HUD.as_slice(), 1, 1), |a| {
-        (a.pixels.as_slice(), a.width, a.height)
+    let (pixels, width, height, static_rows) = atlas.map_or((EMPTY_HUD.as_slice(), 1, 2, 1), |a| {
+        (a.pixels.as_slice(), a.width, a.height, a.static_rows)
     });
     let (glint_pixels, glint_width, glint_height) = atlas
         .map_or((EMPTY_GLINT.as_slice(), 1, 1), |a| {
@@ -18788,7 +18791,7 @@ fn loading_renderer(
         1,
         &[],
         &[],
-        (pixels, width, height),
+        (pixels, width, height, static_rows),
         atlas_file,
         (glint_pixels, glint_width, glint_height),
         (glint_pixels, glint_width, glint_height),

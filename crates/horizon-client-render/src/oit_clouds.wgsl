@@ -5,7 +5,7 @@
 // The cloud's colour; it fades out towards the cloud fog end everywhere but in
 // the depth bounds stage, which sees the unfaded alpha.
 fn oit_cloud_color(in: Out, front: bool, fade: bool) -> vec4<f32> {
-    let color = textureSample(atlas, atlas_sampler, in.uv) * select(in.back_color, in.color, front);
+    let color = atlas_sample(in.uv) * select(in.back_color, in.color, front);
     let faded = 1.0 - linear_fog(in.spherical, 0.0, globals.fog_ends.y);
     return vec4(color.rgb, color.a * select(1.0, faded, fade));
 }

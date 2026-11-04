@@ -40,6 +40,33 @@ struct Globals {
 // The armour layers' GlintSampler: vanilla samples enchanted_glint_armor with
 // the same repeating, linearly filtered sampler as the item glint.
 @group(0) @binding(7) var glint_armor_tex: texture_2d<f32>;
+// The shared atlas is two textures (gfx/shared_atlas.rs): `atlas` holds its
+// static rows and `atlas_dynamic` the rows below them, which the game writes
+// while it runs. Atlas coordinates address both as one atlas as tall as both.
+@group(0) @binding(8) var atlas_dynamic: texture_2d<f32>;
+// Both parts' texels across, and down together.
+fn atlas_size() -> vec2<u32> {
+    return vec2(textureDimensions(atlas).x, textureDimensions(atlas).y + textureDimensions(atlas_dynamic).y);
+}
+// The atlas at `uv` through `atlas_sampler`. It has one level, so the explicit
+// level 0 is what an implicit sample read, and it is valid in any control flow.
+fn atlas_sample(uv: vec2<f32>) -> vec4<f32> {
+    let upper = f32(textureDimensions(atlas).y);
+    let lower = f32(textureDimensions(atlas_dynamic).y);
+    let row = uv.y * (upper + lower);
+    if row < upper {
+        return textureSampleLevel(atlas, atlas_sampler, vec2(uv.x, row / upper), 0.0);
+    }
+    return textureSampleLevel(atlas_dynamic, atlas_sampler, vec2(uv.x, (row - upper) / lower), 0.0);
+}
+// The atlas's texel at `texel` (atlas coordinates).
+fn atlas_load(texel: vec2<i32>) -> vec4<f32> {
+    let upper = i32(textureDimensions(atlas).y);
+    if texel.y < upper {
+        return textureLoad(atlas, texel, 0);
+    }
+    return textureLoad(atlas_dynamic, texel - vec2(0, upper), 0);
+}
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -192,7 +219,7 @@ const PORTAL_COLORS = array<vec3<f32>, 16>(
 // textureProj on a repeating texture that lives in the atlas at `rect`.
 fn portal_sample(rect: vec4<f32>, p: vec4<f32>) -> vec3<f32> {
     let st = fract(p.xy / p.w);
-    return textureSampleLevel(atlas, atlas_sampler, rect.xy + st * rect.zw, 0.0).rgb;
+    return atlas_sample(rect.xy + st * rect.zw).rgb;
 }
 // texProj0 * end_portal_layer(layer): the row vector through mat4(scale * rotate),
 // translate and SCALE_TRANSLATE in turn.
@@ -250,9 +277,9 @@ fn entity_color(in: Out, front: bool) -> vec4<f32> {
     if in.overlay == 6u { uv.y = in.wrap.x + fract(in.uv.y) * in.wrap.y; }
     if in.overlay == 11u || in.overlay == 12u {
         // Each crack's stage sprite origin comes in its light bytes (breaking::stage_light).
-        uv = crumbling_uv(in.uv, in.wrap, globals.crumbling_sprite.zw, textureDimensions(atlas));
+        uv = crumbling_uv(in.uv, in.wrap, globals.crumbling_sprite.zw, atlas_size());
     }
-    var color = textureSample(atlas, atlas_sampler, uv) * select(in.back_color, in.color, front);
+    var color = atlas_sample(uv) * select(in.back_color, in.color, front);
     if in.overlay == 9u || in.overlay == 10u {
         // rendertype_end_portal: end_sky and PORTAL_LAYERS (15 for portals, 16
         // for gateways) layers of end_portal.png projected from the screen.
@@ -296,7 +323,7 @@ fn entity_color(in: Out, front: bool) -> vec4<f32> {
     return shadow_color(in);
 }
 fn shadow_color(in: Out) -> vec4<f32> {
-    var color = textureSample(atlas, atlas_sampler, in.uv) * in.color;
+    var color = atlas_sample(in.uv) * in.color;
     color *= in.light_color;
     let f = max(linear_fog(in.spherical, globals.fog.x, globals.fog.y),
                 linear_fog(in.cylindrical, globals.fog.z, globals.fog.w));
@@ -304,7 +331,7 @@ fn shadow_color(in: Out) -> vec4<f32> {
 }
 
 @fragment fn fs_outline(in: Out) -> @location(0) vec4<f32> {
-    if textureSample(atlas, atlas_sampler, in.uv).a == 0.0 { discard; }
+    if atlas_sample(in.uv).a == 0.0 { discard; }
     return vec4(in.color.rgb, 1.0);
 }
 
@@ -315,12 +342,12 @@ fn shadow_color(in: Out) -> vec4<f32> {
     // Beams wrap their v in the sprite as fs_entity does: sample where they draw.
     var uv = in.uv;
     if in.overlay == 6u { uv.y = in.wrap.x + fract(in.uv.y) * in.wrap.y; }
-    if in.tier == 0u || textureSample(atlas, atlas_sampler, uv).a < 0.1 { discard; }
+    if in.tier == 0u || atlas_sample(uv).a < 0.1 { discard; }
     return vec4(0.0, 0.0, 0.0, 0.7 * f32(4u - min(in.tier, 4u)) / 4.0);
 }
 
 fn celestial_color(in: Out) -> vec4<f32> {
-    return textureSample(atlas, atlas_sampler, in.uv) * in.color * in.light_color;
+    return atlas_sample(in.uv) * in.color * in.light_color;
 }
 @fragment fn fs_celestial(in: Out) -> @location(0) vec4<f32> {
     return celestial_color(in);
@@ -349,7 +376,7 @@ fn celestial_color(in: Out) -> vec4<f32> {
 fn energy_swirl_base(in: Out) -> vec4<f32> {
     let bytes = round(in.color * 255.0);
     let size = vec2(bytes.x + bytes.y * 256.0, bytes.z + bytes.w * 256.0) / 65535.0;
-    let color = textureSample(atlas, atlas_sampler, crumbling_uv(in.uv, in.wrap, size, textureDimensions(atlas)));
+    let color = atlas_sample(crumbling_uv(in.uv, in.wrap, size, atlas_size()));
     if color.a < 0.1 { discard; }
     return vec4(color.rgb * (128.0 / 255.0), color.a);
 }
@@ -494,8 +521,8 @@ struct WeatherTime { values: vec4<f32> }
 fn weather_color(in: Out) -> vec4<f32> {
     // Repeat within this sprite, never across the atlas. The atlas uses nearest
     // filtering and no mipmaps, so fractional UVs have no seam derivatives.
-    let texel = weather_texel(in.uv, in.weather_rect, textureDimensions(atlas));
-    var color = textureLoad(atlas, texel, 0) * in.color;
+    let texel = weather_texel(in.uv, in.weather_rect, atlas_size());
+    var color = atlas_load(texel) * in.color;
     if color.a < 0.1 { discard; }
     color *= in.light_color;
     let f = max(linear_fog(in.spherical, globals.fog.x, globals.fog.y),

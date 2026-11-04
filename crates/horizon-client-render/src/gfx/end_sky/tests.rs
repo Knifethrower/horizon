@@ -165,7 +165,10 @@ fn separate_draws_match_combined_celestial_pixels() {
             ]
         })
         .collect();
-    let atlas = texture(&pixels, 16, 16).create_view(&Default::default());
+    // The shared atlas as the game holds it (gfx/shared_atlas.rs): these 16
+    // rows are its static part, with a row of dynamic part below them.
+    let atlas = crate::gfx::shared_atlas::SharedAtlas::new(&device, 16, 17, 16);
+    atlas.write_rows(&queue, 0, &pixels);
     let lightmap = texture(&[255; 4], 1, 1).create_view(&Default::default());
     let sampler = device.create_sampler(&Default::default());
     let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -184,7 +187,7 @@ fn separate_draws_match_combined_celestial_pixels() {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&atlas),
+                resource: wgpu::BindingResource::TextureView(&atlas.static_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -197,6 +200,10 @@ fn separate_draws_match_combined_celestial_pixels() {
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&atlas.dynamic_view),
             },
         ],
     });
