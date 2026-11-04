@@ -11,7 +11,12 @@ use std::{
 
 fn digest(render: &RenderAssets) -> u64 {
     let mut h = DefaultHasher::new();
-    render.pixels.hash(&mut h);
+    // A freshly loaded pack's pixels are in memory; only a renderer spills them.
+    render
+        .pixels
+        .get()
+        .expect("freshly loaded sprite pixels")
+        .hash(&mut h);
     (
         render.sprite_size,
         render.sprite_minimum_size,

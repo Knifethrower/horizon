@@ -420,7 +420,7 @@ pub(super) fn stage_pack(
         context.biomes.clone(),
         context.light.clone(),
     )?;
-    let textures = prepare_renderer_textures(&pack);
+    let textures = prepare_renderer_textures(&pack)?;
     progress.set(3);
     Ok(StagedPack {
         root,

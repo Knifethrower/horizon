@@ -18300,7 +18300,7 @@ fn load_resources(
     // cannot detach a tail worker that races the next pack-loader generation.
     let prepared_at = Instant::now();
     let game_cpu = menu.then(|| GameCpuResources::load(&root)).transpose()?;
-    let renderer_cpu = menu.then(|| prepare_renderer_textures(&pack));
+    let renderer_cpu = menu.then(|| prepare_renderer_textures(&pack)).transpose()?;
     if menu {
         log::info!(
             "Horizon: handoff CPU resources prepared on worker in {} ms, rss {} MiB",
@@ -18630,15 +18630,50 @@ impl Drop for RestWatch {
     }
 }
 
-fn prepare_renderer_textures(pack: &PackResources) -> horizon_client::gfx::PreparedTextures {
+fn prepare_renderer_textures(
+    pack: &PackResources,
+) -> Result<horizon_client::gfx::PreparedTextures> {
     let assets = &pack.render;
-    horizon_client::gfx::PreparedTextures::new(
-        &assets.pixels,
+    Ok(horizon_client::gfx::PreparedTextures::new(
+        &assets.pixels.get()?,
         assets.sprite_size,
         assets.texture_layers,
         &assets.sprite_mips,
         (&pack.forcefield.2, pack.forcefield.0),
-    )
+    ))
+}
+
+/// The renderer has the block sprites on the GPU now: move their pixels to the
+/// cache folder, beside the GUI atlas's spill, and drop the CPU copy. Hashing
+/// and writing 20 MiB to a handheld's card must not hold the first frames
+/// back, so it runs on a thread of its own, which ends when it is done.
+fn spill_sprite_pixels(pack: &PackResources) {
+    let render = pack.render.clone();
+    let Ok(dir) = std::env::current_dir() else {
+        return;
+    };
+    if render.pixels.is_empty() {
+        return;
+    }
+    let dir = dir.join("cache");
+    let stem = format!("{}-{}l", render.sprite_size, render.texture_layers);
+    let spawned = std::thread::Builder::new()
+        .name("sprite spill".into())
+        .spawn(move || match render.pixels.spill(&dir, &stem) {
+            Ok(Some(path)) => {
+                horizon_threads::release_free_memory();
+                log::info!(
+                    "Horizon: block sprite pixels spilled to {} and their CPU copy dropped, rss {} MiB",
+                    path.display(),
+                    rss_mib()
+                );
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("Horizon: block sprite pixels kept in memory: {e}"),
+        });
+    if let Err(e) = spawned {
+        log::warn!("Horizon: block sprite pixels kept in memory: {e}");
+    }
 }
 
 /// Upload pack textures and create the renderer on the window's device.
@@ -18668,10 +18703,11 @@ fn build_renderer(
     horizon_threads::release_free_memory();
     log::info!("Horizon: building the renderer, rss {} MiB", rss_mib());
     let build_started = std::time::Instant::now();
+    let sprite_pixels = assets.pixels.get()?;
     let mut renderer = pollster::block_on(Renderer::new(
         window,
         offscreen,
-        &assets.pixels,
+        &sprite_pixels,
         assets.sprite_size,
         assets.sprite_minimum_size,
         assets.texture_layers,
@@ -18691,6 +18727,8 @@ fn build_renderer(
         previous,
         api,
     ))?;
+    drop(sprite_pixels);
+    spill_sprite_pixels(pack);
     horizon_threads::release_free_memory();
     log::info!(
         "Horizon: renderer built in {} ms, rss {} MiB",
@@ -19658,7 +19696,7 @@ fn bake_sprites(
     // option asks for, so one bake serves every value of it.
     let bake_size = loaded.pack.render.sprite_size;
     horizon_client::sprites::set_mip_levels(horizon_client::astc::max_levels(bake_size));
-    let prepared = prepare_renderer_textures(&loaded.pack);
+    let prepared = prepare_renderer_textures(&loaded.pack)?;
     let mut total = 0;
     for (_array, size, layers, levels, bytes) in prepared.arrays() {
         let key = horizon_client::astc::pack_key(size, std::iter::once((bytes, levels)));
