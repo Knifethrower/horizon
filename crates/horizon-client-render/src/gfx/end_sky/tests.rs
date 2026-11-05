@@ -203,7 +203,11 @@ fn separate_draws_match_combined_celestial_pixels() {
             },
             wgpu::BindGroupEntry {
                 binding: 8,
-                resource: wgpu::BindingResource::TextureView(&atlas.dynamic_view),
+                resource: wgpu::BindingResource::TextureView(&atlas.dynamic().0),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: atlas.pages().as_entire_binding(),
             },
         ],
     });

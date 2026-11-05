@@ -12,22 +12,45 @@ struct Hud {
 @group(0) @binding(4) var glint_sampler: sampler;
 // The shared atlas is two textures (gfx/shared_atlas.rs): `atlas` holds its
 // static rows and `atlas_dynamic` the rows below them, which the game writes
-// while it runs. Atlas coordinates address both as one atlas as tall as both.
-@group(0) @binding(5) var atlas_dynamic: texture_2d<f32>;
-// Both parts' texels across, and down together.
-fn atlas_size() -> vec2<u32> {
-    return vec2(textureDimensions(atlas).x, textureDimensions(atlas).y + textureDimensions(atlas_dynamic).y);
+// while it runs. Atlas coordinates address both as one atlas `rows.x` rows
+// tall. The dynamic rows are held in bands of `rows.y` rows, only the ones
+// written to, in the order they were first written: `bands` has each band's
+// place in `atlas_dynamic`, four a vector, 0xffffffff for one never written.
+struct AtlasPages {
+    rows: vec4<u32>,
+    bands: array<vec4<u32>, 64>,
 }
-// The atlas at `uv` through `atlas_sampler`. It has one level, so the explicit
-// level 0 is what an implicit sample read, and it is valid in any control flow.
+@group(0) @binding(5) var atlas_dynamic: texture_2d<f32>;
+@group(0) @binding(6) var<uniform> atlas_pages: AtlasPages;
+// The atlas's texels across and down.
+fn atlas_size() -> vec2<u32> {
+    return vec2(textureDimensions(atlas).x, atlas_pages.rows.x);
+}
+// The row of `atlas_dynamic` holding row `row` of the dynamic part, or -1 when
+// its band was never written.
+fn atlas_dynamic_row(row: f32) -> f32 {
+    let band_rows = f32(atlas_pages.rows.y);
+    let band = min(u32(row / band_rows), 255u);
+    let held = atlas_pages.bands[band / 4u][band % 4u];
+    if held == 0xffffffffu {
+        return -1.0;
+    }
+    return f32(held) * band_rows + (row - f32(band) * band_rows);
+}
+// The atlas at `uv` through `atlas_sampler`, transparent black in a band never
+// written. It has one level, so the explicit level 0 is what an implicit
+// sample read, and it is valid in any control flow.
 fn atlas_sample(uv: vec2<f32>) -> vec4<f32> {
     let upper = f32(textureDimensions(atlas).y);
-    let lower = f32(textureDimensions(atlas_dynamic).y);
-    let row = uv.y * (upper + lower);
+    let row = uv.y * f32(atlas_pages.rows.x);
     if row < upper {
         return textureSampleLevel(atlas, atlas_sampler, vec2(uv.x, row / upper), 0.0);
     }
-    return textureSampleLevel(atlas_dynamic, atlas_sampler, vec2(uv.x, (row - upper) / lower), 0.0);
+    let held = atlas_dynamic_row(row - upper);
+    if held < 0.0 {
+        return vec4(0.0);
+    }
+    return textureSampleLevel(atlas_dynamic, atlas_sampler, vec2(uv.x, held / f32(textureDimensions(atlas_dynamic).y)), 0.0);
 }
 struct Out {
     @builtin(position) clip: vec4<f32>,

@@ -487,6 +487,78 @@ pub struct ScreenshotRequest {
     /// `Renderer::screenshot_quality`, not the window's.
     pub scaled: bool,
 }
+/// What the entity bind groups (`entity_group`, `hand_group`) hold besides
+/// their globals and the shared atlas, kept to remake them when the atlas's
+/// dynamic part grows (`shared_atlas`).
+struct EntityResources {
+    layout: wgpu::BindGroupLayout,
+    atlas_sampler: wgpu::Sampler,
+    lightmap: (wgpu::TextureView, wgpu::Sampler),
+    glint: (wgpu::TextureView, wgpu::Sampler),
+    glint_armor_view: wgpu::TextureView,
+    /// The generation of the atlas's dynamic part the groups hold.
+    generation: u64,
+}
+impl EntityResources {
+    /// An entity bind group with `globals` and `atlas` as it is now, and the
+    /// generation of the atlas's dynamic part it holds.
+    fn group(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        globals: &wgpu::Buffer,
+        atlas: &shared_atlas::SharedAtlas,
+    ) -> (wgpu::BindGroup, u64) {
+        let (dynamic_view, generation) = atlas.dynamic();
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&atlas.static_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.lightmap.0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.lightmap.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.glint.0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.glint.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&self.glint_armor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&dynamic_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: atlas.pages().as_entire_binding(),
+                },
+            ],
+        });
+        (group, generation)
+    }
+}
 pub struct Renderer {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -603,6 +675,8 @@ pub struct Renderer {
     entity_group: wgpu::BindGroup,
     /// The entity resources with the hand's projection (`hand_globals`).
     hand_group: wgpu::BindGroup,
+    /// What `entity_group` and `hand_group` are made of.
+    entity_resources: EntityResources,
     hand_globals: wgpu::Buffer,
     entity_buffer: wgpu::Buffer,
     entity_capacity: u64,
@@ -2475,8 +2549,9 @@ impl Renderer {
             }
         };
         let (upper, lower) = atlas.bytes();
+        let (held, bands) = atlas.bands();
         log::info!(
-            "Horizon: shared atlas static rows {atlas_width}x{} {} ({} MiB), dynamic rows {atlas_width}x{} RGBA ({} MiB)",
+            "Horizon: shared atlas static rows {atlas_width}x{} {} ({} MiB), dynamic rows {atlas_width}x{} RGBA in {}-row bands, {held} of {bands} held ({} MiB)",
             atlas.static_rows,
             if atlas.compressed() {
                 "from their ASTC bake"
@@ -2485,10 +2560,9 @@ impl Renderer {
             },
             upper / (1024 * 1024),
             atlas.height - atlas.static_rows,
+            shared_atlas::BAND_ROWS,
             lower / (1024 * 1024)
         );
-        let atlas_view = atlas.static_view.clone();
-        let atlas_dynamic_view = atlas.dynamic_view.clone();
         // vanilla's `GlintSampler`: enchanted_glint_item as its own texture,
         // repeated per pixel (`clamp: false`), linear without mipmaps
         // (`blur: true`).
@@ -2544,14 +2618,13 @@ impl Renderer {
             glint_armor_pixels,
         );
         let glint_armor_view = glint_armor_texture.create_view(&Default::default());
-        let mut hud = HudRenderer::new(
+        let hud = HudRenderer::new(
             &device,
             config.format.remove_srgb_suffix(),
-            [&atlas_view, &atlas_dynamic_view],
+            atlas.clone(),
             &glint_view,
             &glint_sampler,
         )?;
-        hud.atlas = Some(atlas);
         let entity_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon entities"),
             source: wgpu::ShaderSource::Wgsl(entity_shader().into()),
@@ -2629,6 +2702,16 @@ impl Renderer {
                         multisampled: false,
                     },
                 ),
+                // Where the dynamic rows' bands are held (`SharedAtlas::pages`).
+                entry(
+                    9,
+                    vf,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
             ],
         });
         let weather = weather::Weather::new(
@@ -2641,90 +2724,23 @@ impl Renderer {
             label: Some("Atlas"),
             ..Default::default()
         });
-        let entity_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Entity resources"),
-            layout: &entity_bindings,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&lightmap_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&lightmap_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&glint_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&glint_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&glint_armor_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&atlas_dynamic_view),
-                },
-            ],
-        });
-        let hand_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("First-person hand resources"),
-            layout: &entity_bindings,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: hand_globals.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&lightmap_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&lightmap_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&glint_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&glint_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&glint_armor_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&atlas_dynamic_view),
-                },
-            ],
-        });
+        let mut entity_resources = EntityResources {
+            layout: entity_bindings.clone(),
+            atlas_sampler: atlas_sampler.clone(),
+            lightmap: (lightmap_view.clone(), lightmap_sampler.clone()),
+            glint: (glint_view.clone(), glint_sampler.clone()),
+            glint_armor_view: glint_armor_view.clone(),
+            generation: 0,
+        };
+        let (entity_group, generation) =
+            entity_resources.group(&device, "Entity resources", &globals, &atlas);
+        let (hand_group, _) = entity_resources.group(
+            &device,
+            "First-person hand resources",
+            &hand_globals,
+            &atlas,
+        );
+        entity_resources.generation = generation;
         let entity_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Entity layout"),
             bind_group_layouts: &[Some(&entity_bindings)],
@@ -3568,6 +3584,7 @@ impl Renderer {
             screen_capacity,
             entity_group,
             hand_group,
+            entity_resources,
             hand_globals,
             entity_buffer,
             entity_capacity,
@@ -6059,6 +6076,25 @@ impl Renderer {
             frame.hud,
             [self.config.width, self.config.height],
         );
+        // The frame's atlas writes are staged: the entity groups are remade
+        // before the first pass when they grew the atlas's dynamic part (the
+        // groups made before hold the texture it replaced).
+        if let Some(atlas) = &self.hud.atlas
+            && atlas.generation() != self.entity_resources.generation
+        {
+            let (entity_group, generation) =
+                self.entity_resources
+                    .group(&self.device, "Entity resources", &self.globals, atlas);
+            let (hand_group, _) = self.entity_resources.group(
+                &self.device,
+                "First-person hand resources",
+                &self.hand_globals,
+                atlas,
+            );
+            self.entity_group = entity_group;
+            self.hand_group = hand_group;
+            self.entity_resources.generation = generation;
+        }
         if culling && let Some(cull) = &mut self.cull {
             cull.upload(
                 &self.device,

@@ -1756,6 +1756,12 @@ pub struct HudRenderer {
     vignette_pipeline: wgpu::RenderPipeline,
     end_portal_pipeline: wgpu::RenderPipeline,
     group: wgpu::BindGroup,
+    /// What `group` is made of, remade when the shared atlas's dynamic part
+    /// grows (`SharedAtlas::generation`, the one `group` holds).
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    glint: (wgpu::TextureView, wgpu::Sampler),
+    atlas_generation: u64,
     uniform: wgpu::Buffer,
     buffer: wgpu::Buffer,
     capacity: u64,
@@ -1767,15 +1773,14 @@ pub struct HudRenderer {
     pub zoom: f32,
 }
 impl HudRenderer {
-    /// `views`: the shared atlas's static and dynamic parts (`gfx::shared_atlas`).
+    /// `atlas`: the shared atlas on the GPU (`gfx::shared_atlas`).
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        views: [&wgpu::TextureView; 2],
+        atlas: crate::gfx::shared_atlas::SharedAtlas,
         glint_view: &wgpu::TextureView,
         glint_sampler: &wgpu::Sampler,
     ) -> Result<Self> {
-        let [view, dynamic_view] = views;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon HUD"),
             source: wgpu::ShaderSource::Wgsl(include_str!("hud.wgsl").into()),
@@ -1846,38 +1851,22 @@ impl HudRenderer {
                     },
                     count: None,
                 },
-            ],
-        });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("HUD resources"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(glint_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(glint_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(dynamic_view),
+                // Where the dynamic rows' bands are held (`SharedAtlas::pages`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
             ],
         });
+        let glint = (glint_view.clone(), glint_sampler.clone());
+        let (group, atlas_generation) =
+            Self::make_group(device, &layout, &uniform, &atlas, &sampler, &glint);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("HUD layout"),
             bind_group_layouts: &[Some(&layout)],
@@ -1996,7 +1985,7 @@ impl HudRenderer {
             mapped_at_creation: false,
         });
         Ok(Self {
-            atlas: None,
+            atlas: Some(atlas),
             sprite_animations: Vec::new(),
             pipeline,
             invert_pipeline,
@@ -2005,6 +1994,10 @@ impl HudRenderer {
             vignette_pipeline,
             end_portal_pipeline,
             group,
+            layout,
+            sampler,
+            glint,
+            atlas_generation,
             uniform,
             buffer,
             capacity,
@@ -2012,6 +2005,71 @@ impl HudRenderer {
             pack_text: None,
             zoom: 1.0,
         })
+    }
+    /// The HUD's bind group, with the shared atlas's dynamic part as it is
+    /// now, and the generation of that part it holds.
+    fn make_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        uniform: &wgpu::Buffer,
+        atlas: &crate::gfx::shared_atlas::SharedAtlas,
+        sampler: &wgpu::Sampler,
+        (glint_view, glint_sampler): &(wgpu::TextureView, wgpu::Sampler),
+    ) -> (wgpu::BindGroup, u64) {
+        let (dynamic_view, generation) = atlas.dynamic();
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("HUD resources"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&atlas.static_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(glint_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(glint_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&dynamic_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: atlas.pages().as_entire_binding(),
+                },
+            ],
+        });
+        (group, generation)
+    }
+    /// Remake the bind group after the shared atlas's dynamic part grew: the
+    /// one made before holds the texture it replaced.
+    fn refresh_group(&mut self, device: &wgpu::Device) {
+        let Some(atlas) = &self.atlas else {
+            return;
+        };
+        if atlas.generation() == self.atlas_generation {
+            return;
+        }
+        (self.group, self.atlas_generation) = Self::make_group(
+            device,
+            &self.layout,
+            &self.uniform,
+            atlas,
+            &self.sampler,
+            &self.glint,
+        );
     }
     /// Draw the GUI's text with `shader` (`HudAtlas::text_shader`), or natively.
     /// The pack's shader samples the shared atlas as one texture: it gets the
@@ -2102,6 +2160,9 @@ impl HudRenderer {
         size: [u32; 2],
     ) {
         self.upload_patches(uploads, encoder, &batch.patches);
+        // The frame's writes are staged (the animated sprites before this):
+        // the group gets the dynamic part they may have grown.
+        self.refresh_group(device);
         if batch.vertices.is_empty() || size.contains(&0) {
             return;
         }
