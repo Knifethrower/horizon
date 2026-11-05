@@ -1,6 +1,6 @@
 //! Behaviour tables built once from the pinned client resources.
 use super::{
-    Behaviours, GameplayStateSource,
+    Behaviours, GameplayProjection, GameplayStateSource,
     classes::{Class, ClassSet, Interface},
     states::{BlockId, PropKey, StateTable},
 };
@@ -682,11 +682,46 @@ fn build_with_behaviour_json(
     root: &Path,
     behaviour: &Value,
 ) -> io::Result<Behaviours> {
-    let gameplay = read_json(&root.join("gameplay-facts.json"))?;
-    let gameplay_states = gameplay["states"]
-        .as_array()
-        .ok_or_else(|| fail("missing gameplay states"))?;
-    build_with_gameplay(registry, root, behaviour, gameplay_states)
+    let gameplay_states = read_gameplay(&root.join("gameplay-facts.json"))?;
+    build_with_gameplay(registry, root, behaviour, &gameplay_states)
+}
+
+/// `gameplay-facts.json` with each state kept only as what the tables read. The file is 55 MB:
+/// whole as a `Value` tree it held 540 MiB through a first launch's table build, past what a
+/// 1 GB handheld has beside the rest of the load, and the game was killed. One state's tree at
+/// a time is next to nothing; the rows are a few MiB.
+fn read_gameplay(path: &Path) -> io::Result<Vec<GameplayProjection>> {
+    #[derive(serde::Deserialize)]
+    struct Gameplay {
+        #[serde(default, deserialize_with = "projected")]
+        states: Option<Vec<GameplayProjection>>,
+    }
+    fn projected<'de, D: serde::Deserializer<'de>>(
+        file: D,
+    ) -> Result<Option<Vec<GameplayProjection>>, D::Error> {
+        struct States;
+        impl<'de> serde::de::Visitor<'de> for States {
+            type Value = Vec<GameplayProjection>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of gameplay states")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut states: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut strings = HashMap::new();
+                let mut rows = Vec::with_capacity(states.size_hint().unwrap_or(0));
+                while let Some(state) = states.next_element::<Value>()? {
+                    rows.push(GameplayProjection::from_source(&state, &mut strings));
+                }
+                Ok(rows)
+            }
+        }
+        file.deserialize_seq(States).map(Some)
+    }
+    let file: Gameplay =
+        serde_json::from_slice(&fs::read(path)?).map_err(|e| invalid(e.to_string()))?;
+    file.states.ok_or_else(|| fail("missing gameplay states"))
 }
 
 fn build_with_gameplay<G: GameplayStateSource>(
@@ -1207,5 +1242,65 @@ impl GameplayStateSource for Value {
             .and_then(|s| s.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("")
+    }
+}
+
+#[cfg(test)]
+mod gameplay_tests {
+    use super::*;
+
+    fn read(json: &str) -> io::Result<Vec<GameplayProjection>> {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-gameplay-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("gameplay-facts.json");
+        fs::write(&path, json)?;
+        let result = read_gameplay(&path);
+        fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    /// A row reads as the state's own JSON does, whatever else the file holds.
+    #[test]
+    fn a_row_reads_as_the_states_json() {
+        let state = r#"{"id": 7, "emission": 12, "dampening": 3, "hardness": 1.5, "push": "BLOCK",
+            "solid_render": true, "liquid": false, "shape_occlusion": true, "unused": [1, 2],
+            "render_shape": "MODEL",
+            "sound": {"volume": 0.8, "pitch": 1.2, "place": {"id": "a:place"},
+                      "break": {"id": "a:break"}, "fall": {"id": "a:fall"}}}"#;
+        let rows = read(&format!(r#"{{"other": 1, "states": [{state}, {{}}]}}"#)).unwrap();
+        assert_eq!(rows.len(), 2);
+        let value: Value = serde_json::from_str(state).unwrap();
+        let empty = serde_json::json!({});
+        for (row, json) in [(&rows[0], &value), (&rows[1], &empty)] {
+            for flag in super::super::GAMEPLAY_FLAGS {
+                assert_eq!(row.flag(flag), json.flag(flag), "{flag}");
+            }
+            for key in ["emission", "dampening"] {
+                assert_eq!(row.unsigned(key), json.unsigned(key));
+            }
+            assert_eq!(row.number("hardness"), json.number("hardness"));
+            assert_eq!(row.text("push"), json.text("push"));
+            for key in ["volume", "pitch"] {
+                assert_eq!(row.sound_number(key), json.sound_number(key));
+            }
+            for key in ["place", "break", "fall"] {
+                assert_eq!(row.sound_id(key), json.sound_id(key));
+            }
+        }
+    }
+
+    /// What the whole tree refused, the rows refuse.
+    #[test]
+    fn a_file_without_a_states_array_fails() {
+        assert!(read("{}").is_err());
+        assert!(read(r#"{"states": 1}"#).is_err());
+        assert!(read(r#"{"states": {}}"#).is_err());
+        assert!(read("[]").is_err());
+        assert!(read("{").is_err());
+        assert!(read(r#"{"states": []}"#).unwrap().is_empty());
     }
 }

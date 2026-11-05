@@ -684,6 +684,111 @@ pub trait GameplayStateSource {
     fn sound_id(&self, name: &str) -> &str;
 }
 
+/// The state flags [`Behaviours`] reads, in [`GameplayProjection`]'s bit order.
+const GAMEPLAY_FLAGS: [&str; 11] = [
+    "replaceable",
+    "random_ticks",
+    "solid_render",
+    "liquid",
+    "block_entity",
+    "ignited_by_lava",
+    "can_occlude",
+    "full_collision",
+    "skylight_down",
+    "requires_tool",
+    "shape_occlusion",
+];
+
+/// Compact, owned behaviour inputs: what the tables read of one state's gameplay facts.
+/// No borrowed gameplay JSON or process-wide cache survives the loader that makes them.
+pub struct GameplayProjection {
+    flags: u16,
+    emission: u64,
+    dampening: u64,
+    hardness: f64,
+    push: Arc<str>,
+    volume: f64,
+    pitch: f64,
+    place: Arc<str>,
+    break_sound: Arc<str>,
+    fall: Arc<str>,
+}
+
+impl GameplayProjection {
+    /// One state's fields from `source`, its strings shared through `strings`.
+    pub fn from_source<G: GameplayStateSource>(
+        source: &G,
+        strings: &mut HashMap<String, Arc<str>>,
+    ) -> Self {
+        fn intern(strings: &mut HashMap<String, Arc<str>>, value: &str) -> Arc<str> {
+            if let Some(existing) = strings.get(value) {
+                return Arc::clone(existing);
+            }
+            let value_arc: Arc<str> = Arc::from(value);
+            strings.insert(value.to_owned(), Arc::clone(&value_arc));
+            value_arc
+        }
+        Self {
+            flags: GAMEPLAY_FLAGS
+                .iter()
+                .enumerate()
+                .fold(0, |flags, (i, name)| {
+                    flags | ((u16::from(source.flag(name))) << i)
+                }),
+            emission: source.unsigned("emission"),
+            dampening: source.unsigned("dampening"),
+            hardness: source.number("hardness"),
+            push: intern(strings, source.text("push")),
+            volume: source.sound_number("volume"),
+            pitch: source.sound_number("pitch"),
+            place: intern(strings, source.sound_id("place")),
+            break_sound: intern(strings, source.sound_id("break")),
+            fall: intern(strings, source.sound_id("fall")),
+        }
+    }
+}
+
+impl GameplayStateSource for GameplayProjection {
+    fn flag(&self, name: &str) -> bool {
+        GAMEPLAY_FLAGS
+            .iter()
+            .position(|field| *field == name)
+            .is_some_and(|index| self.flags & (1 << index) != 0)
+    }
+    fn unsigned(&self, name: &str) -> u64 {
+        match name {
+            "emission" => self.emission,
+            "dampening" => self.dampening,
+            _ => 0,
+        }
+    }
+    fn number(&self, name: &str) -> f64 {
+        if name == "hardness" {
+            self.hardness
+        } else {
+            0.0
+        }
+    }
+    fn text(&self, name: &str) -> &str {
+        if name == "push" { &self.push } else { "" }
+    }
+    fn sound_number(&self, name: &str) -> f64 {
+        match name {
+            "volume" => self.volume,
+            "pitch" => self.pitch,
+            _ => 1.0,
+        }
+    }
+    fn sound_id(&self, name: &str) -> &str {
+        match name {
+            "place" => &self.place,
+            "break" => &self.break_sound,
+            "fall" => &self.fall,
+            _ => "",
+        }
+    }
+}
+
 /// Immutable vanilla block-behaviour tables. Build once with [`Behaviours::load`].
 pub struct Behaviours {
     pub table: StateTable,
