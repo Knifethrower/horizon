@@ -67,6 +67,10 @@ fn sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<
     if (animated_layer != 0xFFFFFFFFu) {
         return textureSampleGrad(animated, sprite_sampler, uv, i32(animated_layer), dx, dy);
     }
+    return stored_sprite_grad(uv, layer, dx, dy);
+}
+// The same for a sprite that does not animate.
+fn stored_sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     let l = i32(layer % SPRITE_SPLIT);
     if SPRITE_ARRAYS == 1u {
         return textureSampleGrad(sprites, sprite_sampler, uv, l, dx, dy);
@@ -356,6 +360,70 @@ fn brightness(c: vec3<f32>) -> f32 {
 }
 @fragment fn fs_solid(in: TerrainOut) -> @location(0) vec4<f32> {
     return solid_color(in);
+}
+// Whole sections when nothing but the sprite, the light and the fog applies (gfx.rs's
+// `plain_terrain`): no fade, no HDR alpha, no emissive layers, no dynamic lights, no RGSS, no distant
+// tiles. The same picture from far less work: a vertex writes 9 values instead of 17, and a pixel
+// neither looks its layer up (the vertex did) nor divides for its fog.
+struct PlainOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    // The layer in `animated` with `PLAIN_ANIMATED` set, or else in the sprite arrays.
+    @location(1) @interpolate(flat) layer: u32,
+    @location(2) color: vec4<f32>,
+    // `linear_fog`'s two fractions, not yet clamped: they interpolate as the distances would.
+    @location(3) fog: vec2<f32>,
+}
+const PLAIN_ANIMATED: u32 = 0x80000000u;
+fn fog_fraction(d: f32, start: f32, end: f32) -> f32 {
+    return (d - start) / max(end - start, 1e-6);
+}
+@vertex fn vs_terrain_plain(
+    @location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
+    @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>,
+    @location(5) origin: vec4<f32>) -> PlainOut {
+    let pos = position + origin.xyz;
+    var out: PlainOut;
+    out.clip = globals.view_proj * vec4(pos, 1.0);
+    out.uv = terrain_uv(uv, origin.w);
+    let sprite = layer & 0x7fffu;
+    let animated_layer = textureLoad(layer_map, vec2<i32>(i32(sprite), 0), 0).r;
+    out.layer = select(sprite, animated_layer | PLAIN_ANIMATED, animated_layer != 0xFFFFFFFFu);
+    out.color = vec4(color.rgb, 1.0) * sample_lightmap(f32(light.x) / 16.0, f32(light.y) / 16.0);
+    out.fog = vec2(fog_fraction(length(pos), globals.fog.x, globals.fog.y),
+        fog_fraction(max(length(pos.xz), abs(pos.y)), globals.fog.z, globals.fog.w));
+    return out;
+}
+fn plain_texel(in: PlainOut) -> vec4<f32> {
+    let du = dpdx(in.uv);
+    let dv = dpdy(in.uv);
+    let pixel = vec2(1.0 / globals.filtering.y);
+    let texel_screen = sqrt(du * du + dv * dv);
+    // sample_nearest's arithmetic (texture_sampling.glsl)
+    let texel_coords = in.uv / pixel;
+    let center = round(texel_coords) - 0.5;
+    var offset = texel_coords - center;
+    offset = (offset - 0.5) * pixel / max(texel_screen, vec2(1e-12)) + 0.5;
+    offset = clamp(offset, vec2(0.0), vec2(1.0));
+    let uv = (center + offset) * pixel;
+    if (in.layer & PLAIN_ANIMATED) != 0u {
+        return textureSampleGrad(animated, sprite_sampler, uv, i32(in.layer & 0x7fffffffu), du, dv);
+    }
+    return stored_sprite_grad(uv, in.layer, du, dv);
+}
+fn plain_lit(in: PlainOut, texel: vec4<f32>) -> vec4<f32> {
+    let f = clamp(max(in.fog.x, in.fog.y), 0.0, 1.0);
+    return vec4(mix(texel.rgb * in.color.rgb, globals.fog_color.rgb, f * globals.fog_color.a), 1.0);
+}
+// `plain_terrain` of `fs_solid_opaque`: no `discard`.
+@fragment fn fs_solid_plain_opaque(in: PlainOut) -> @location(0) vec4<f32> {
+    return plain_lit(in, plain_texel(in));
+}
+// `plain_terrain` of `fs_solid`: the rest, with their cut-out texels.
+@fragment fn fs_solid_plain(in: PlainOut) -> @location(0) vec4<f32> {
+    let texel = plain_texel(in);
+    if texel.a * in.color.a < 0.5 { discard; }
+    return plain_lit(in, texel);
 }
 // Whole sections' faces over opaque texels (mesher/sides.rs): what `solid_color` gives them, as
 // neither of its discards can fire. A shader without `discard` lets a tile-based GPU reject hidden

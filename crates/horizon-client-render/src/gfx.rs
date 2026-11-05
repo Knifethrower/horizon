@@ -604,6 +604,10 @@ pub struct Renderer {
     solid: wgpu::RenderPipeline,
     /// The solid pipeline without `discard`, for faces over opaque texels: `opaque_draws`.
     solid_opaque: wgpu::RenderPipeline,
+    /// `solid_opaque` and `solid` when the frame needs nothing but the sprite, the light and the
+    /// fog: `plain_terrain`.
+    plain_opaque: wgpu::RenderPipeline,
+    plain_rest: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
     /// Flat section draws (`flat`), where multi-draw is emulated.
     flat: Option<flat::Flat>,
@@ -1955,6 +1959,28 @@ impl Renderer {
             "Terrain solid, opaque faces",
             "vs_terrain",
             "fs_solid_opaque",
+            &terrain_buffers,
+            tri,
+            Some(wgpu::Face::Back),
+            true,
+            true,
+            None,
+        );
+        let plain_opaque = pipeline(
+            "Terrain solid, plain opaque faces",
+            "vs_terrain_plain",
+            "fs_solid_plain_opaque",
+            &terrain_buffers,
+            tri,
+            Some(wgpu::Face::Back),
+            true,
+            true,
+            None,
+        );
+        let plain_rest = pipeline(
+            "Terrain solid, plain",
+            "vs_terrain_plain",
+            "fs_solid_plain",
             &terrain_buffers,
             tri,
             Some(wgpu::Face::Back),
@@ -3559,6 +3585,8 @@ impl Renderer {
             crosshair_group,
             crosshair_globals,
             solid_opaque,
+            plain_opaque,
+            plain_rest,
             solid_mirror,
             mirror_globals,
             mirror_group,
@@ -6750,9 +6778,25 @@ impl Renderer {
                         }
                         // A shader pack's material draws them all alike.
                         None if opaque_draws > 0 && material.is_none() => {
-                            pass.set_pipeline(&self.solid_opaque);
+                            // What `solid_color` tests, none of them in play this frame: nothing
+                            // reads the alpha without HDR output, and RGSS samples otherwise.
+                            let plain_terrain = self.hdr.is_none()
+                                && self.texture_filtering != 1
+                                && frame.chunk_fade <= 0.0
+                                && frame.dynamic_lights.is_empty()
+                                && frame.colored_lights.is_empty()
+                                && frame.emissive_layers.is_empty();
+                            pass.set_pipeline(if plain_terrain {
+                                &self.plain_opaque
+                            } else {
+                                &self.solid_opaque
+                            });
                             self.draw_sections(&mut pass, &self.indirect, 0, 0, opaque_draws);
-                            pass.set_pipeline(solid_pipeline);
+                            pass.set_pipeline(if plain_terrain {
+                                &self.plain_rest
+                            } else {
+                                solid_pipeline
+                            });
                             self.draw_sections(
                                 &mut pass,
                                 &self.indirect,
