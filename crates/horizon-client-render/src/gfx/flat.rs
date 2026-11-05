@@ -87,7 +87,7 @@ pub struct Call {
 
 pub struct Flat {
     /// The solid draws in one pass (`fs_solid`), where the GPU doesn't hide pixels
-    /// by tiles (`split_solid` in `Renderer::draw_frame`: elsewhere than Metal).
+    /// by tiles (`split_solid` in `Renderer::draw_frame`: where GPU culling is offered).
     pub solid: SolidPipeline,
     /// The solid draws in two passes, each over its own part of the draws (terrain.wgsl's
     /// `opaque_quad`): the quads with no cutout first, through a shader that never discards,

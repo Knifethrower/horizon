@@ -1195,6 +1195,9 @@ pub struct Renderer {
     gpu_culling: Option<gpu_culling::GpuCulling>,
     gpu_culling_offer: crate::graphics::GpuCullingOffer,
     gpu_frame: bool,
+    /// Solid terrain drawn in two passes, its opaque quads through a shader that never
+    /// discards (`solid_opaque`, `mesher::group_parts`): where GPU culling is not offered.
+    split_solid: bool,
     /// GPU frames since GPU culling was switched on: the first and every 64th after it
     /// check its records (`check_gpu_records`).
     #[cfg(debug_assertions)]
@@ -5277,9 +5280,6 @@ impl Renderer {
             .flags
             .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
         let flat_wanted = flat::wanted(&adapter, &device);
-        // Metal draws solid terrain in two passes (`split_solid`): meshes put all
-        // their opaque quads first, so each pass draws its part in a run or two.
-        crate::mesher::group_parts(adapter.get_info().backend == wgpu::Backend::Metal);
         // Readable as storage where flat draws run: a shader pack's terrain program reads them.
         let arena = arena::Arena::new(
             &device,
@@ -5409,6 +5409,14 @@ impl Renderer {
             gpu_culling_offer
         };
         crate::graphics::offer_gpu_culling(gpu_culling_offer);
+        // Solid terrain in two passes (`split_solid`), the opaque quads first through a
+        // shader that never discards: a tiled GPU (Apple's behind Metal, a handheld's Mali)
+        // rejects hidden pixels and writes depth early only for a shader like that. Meshes
+        // then put all their opaque quads first, so each pass draws its part in a run or two.
+        // Not where GPU culling is offered (never on Metal or OpenGL): its facing test reads
+        // meshes sorted for one pass (`Sides::thresholds`).
+        let split_solid = gpu_culling_offer != crate::graphics::GpuCullingOffer::Offered;
+        crate::mesher::group_parts(split_solid);
         // A new renderer runs no shader pack: the game loads the picked one on its
         // first world frame (`shader_pack`: the picked pack draws flat, a `shaders/`
         // pack or one of Horizon's own with `[shadow]`), and the frames before it, the
@@ -5534,6 +5542,7 @@ impl Renderer {
             gpu_culling: None,
             gpu_culling_offer,
             gpu_frame: false,
+            split_solid,
             #[cfg(debug_assertions)]
             gpu_checks: 0,
             cull,
@@ -9405,11 +9414,11 @@ impl Renderer {
         self.phase2_pages.clear();
         self.solid_runs.clear();
         self.phase2_runs.clear();
-        // On Metal, phase 1 goes the opaque quads of every list, then the cutout
-        // ones (`Part`), each solid pass drawing its own: `[..opaque_draws]`,
-        // then the rest; phase 2 likewise. A fading list's quads all draw in the
-        // cutout pass.
-        let split_solid = self.info.backend == wgpu::Backend::Metal && !warp_on;
+        // With two solid passes (`Renderer::split_solid`), phase 1 goes the opaque quads
+        // of every list, then the cutout ones (`Part`), each solid pass drawing its own:
+        // `[..opaque_draws]`, then the rest; phase 2 likewise. A fading list's quads all
+        // draw in the cutout pass.
+        let split_solid = self.split_solid && !warp_on;
         let parts = |fading: bool| -> &'static [(u8, Quads)] {
             match (split_solid, fading) {
                 (false, _) => &[(0, Quads::All)],
@@ -9420,7 +9429,7 @@ impl Renderer {
         let (mut opaque_draws, mut phase2_opaque) = (0, 0);
         debug_assert!(
             !(split_solid && gpu_frame),
-            "GPU culling is never offered on Metal"
+            "GPU culling is never offered with two solid passes"
         );
         // In a GPU frame the GPU draws the solid quads of the whole sections within the
         // render distance that have records (`SectionGpu::gpu_draws_solid`), and the walk
@@ -10953,10 +10962,10 @@ impl Renderer {
             Some(w) => w.solid.get(hdr),
             None => material.map_or(self.solid.get(hdr), |(m, _)| &m.solid),
         };
-        // Two solid passes only where a discard costs the GPU its hidden surface
-        // removal: Apple's tiled GPUs, behind Metal. Elsewhere the second pass
-        // would double the solid draw calls and vertex work for nothing.
-        let split_solid = self.info.backend == wgpu::Backend::Metal && !warp_on;
+        // Two solid passes where a discard can cost the GPU its hidden surface removal
+        // (`Renderer::split_solid`): a tiled GPU, Apple's behind Metal or a handheld's
+        // Mali behind OpenGL, rejects hidden pixels early only for a shader without one.
+        let split_solid = self.split_solid && !warp_on;
         let translucent_pipeline = match warped {
             Some(w) => &w.translucent,
             None => material.map_or(&self.translucent, |(m, _)| &m.translucent),
