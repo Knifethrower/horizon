@@ -357,6 +357,15 @@ fn brightness(c: vec3<f32>) -> f32 {
 @fragment fn fs_solid(in: TerrainOut) -> @location(0) vec4<f32> {
     return solid_color(in);
 }
+// Whole sections' faces over opaque texels (mesher/sides.rs): what `solid_color` gives them, as
+// neither of its discards can fire. A shader without `discard` lets a tile-based GPU reject hidden
+// pixels and write depth early.
+@fragment fn fs_solid_opaque(in: TerrainOut) -> @location(0) vec4<f32> {
+    let texel = sprite(in.uv, in.layer & 0x7fffu);
+    var color = texel * in.color;
+    color = mix(globals.fog_color * vec4(1.0, 1.0, 1.0, color.a), color, in.visibility);
+    return solid_lit(in, texel, color);
+}
 // The water mirror (gfx.rs's reflection pass): what lies below the water plane
 // (`fog_ends.w`, camera-relative) would show above it in the mirror, so it is cut away.
 @fragment fn fs_solid_mirror(in: TerrainOut) -> @location(0) vec4<f32> {
@@ -373,6 +382,9 @@ fn solid_color(in: TerrainOut) -> vec4<f32> {
     // terrain.fsh: the fade-in mixes toward the fog colour.
     color = mix(globals.fog_color * vec4(1.0, 1.0, 1.0, color.a), color, in.visibility);
     if color.a < 0.5 && (in.layer & 0x8000u) == 0u { discard; }
+    return solid_lit(in, texel, color);
+}
+fn solid_lit(in: TerrainOut, texel: vec4<f32>, color: vec4<f32>) -> vec4<f32> {
     // Below 0.75, alpha tells HDR output (hdr.wgsl) a light source's pixel may
     // shine, and at which tier (mesher::hdr_tier): 0.525 at the lowest, 0 at the
     // brightest. Only pixels as bright as their sprite's threshold may: its

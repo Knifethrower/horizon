@@ -602,6 +602,8 @@ pub struct Renderer {
     device_lost: Arc<std::sync::atomic::AtomicBool>,
     pub config: wgpu::SurfaceConfiguration,
     solid: wgpu::RenderPipeline,
+    /// The solid pipeline without `discard`, for faces over opaque texels: `opaque_draws`.
+    solid_opaque: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
     /// Flat section draws (`flat`), where multi-draw is emulated.
     flat: Option<flat::Flat>,
@@ -1949,6 +1951,17 @@ impl Renderer {
         );
         // The water mirror's camera sees the world from the other side of the plane, which
         // flips the winding: its solid terrain culls the front.
+        let solid_opaque = pipeline(
+            "Terrain solid, opaque faces",
+            "vs_terrain",
+            "fs_solid_opaque",
+            &terrain_buffers,
+            tri,
+            Some(wgpu::Face::Back),
+            true,
+            true,
+            None,
+        );
         let solid_mirror = pipeline(
             "Terrain solid (mirrored)",
             "vs_terrain",
@@ -3545,6 +3558,7 @@ impl Renderer {
             debug_line_capacity: 4096,
             crosshair_group,
             crosshair_globals,
+            solid_opaque,
             solid_mirror,
             mirror_globals,
             mirror_group,
@@ -5525,45 +5539,72 @@ impl Renderer {
             .and_then(|cull| cull.begin(&self.device).then_some(cull));
         self.phase2_draws.clear();
         self.phase2_pages.clear();
-        self.solid_runs.clear();
         self.phase2_runs.clear();
-        for (i, v) in visible.iter().enumerate() {
-            let s = self.sections.get(v.slot);
-            let first_phase = cull.as_ref().is_none_or(|c| c.first(v.slot));
-            let (draws, pages) = if first_phase {
-                (&mut self.draws, &mut self.draw_pages)
-            } else {
-                (&mut self.phase2_draws, &mut self.phase2_pages)
-            };
-            let start = draws.len();
-            let instances = u32::from(first_phase);
-            let mut indices = 0;
-            facing_runs_from(&s.sides, eye, mirror_low, v.origin, |first, quads| {
-                indices += quads * 6;
-                let base = s.start as u32 + first * 4;
-                draws.push([quads * 6, instances, 0, base, i as u32]);
-                pages.push((s.page, None));
-            });
-            let runs = if first_phase {
-                &mut self.solid_runs
-            } else {
-                &mut self.phase2_runs
-            };
-            runs.push(
-                v.distance,
-                s.page,
-                start,
-                draws.len() - start,
-                [i as u32, v.slot, indices],
-            );
-            if let Some(c) = &mut cull
-                && first_phase
-            {
-                c.drawn(i, v.slot, indices);
+        // Faces over opaque texels first, in draws of their own, where the world pass draws
+        // them through `solid_opaque`: not with occlusion culling or flat draws, which take one
+        // list, nor with a shader pack's terrain or distant tiles, whose fades discard.
+        let split_opaque = cull.is_none()
+            && self.flat.is_none()
+            && !pack_terrain
+            && self.lods.is_empty()
+            && visible_lods.is_empty();
+        let groups: &[SolidGroup] = if split_opaque {
+            &[SolidGroup::Opaque, SolidGroup::Rest]
+        } else {
+            &[SolidGroup::All]
+        };
+        let mut opaque_draws = 0;
+        for &group in groups {
+            let group_start = self.draws.len();
+            self.solid_runs.clear();
+            for (i, v) in visible.iter().enumerate() {
+                let s = self.sections.get(v.slot);
+                let first_phase = cull.as_ref().is_none_or(|c| c.first(v.slot));
+                let (draws, pages) = if first_phase {
+                    (&mut self.draws, &mut self.draw_pages)
+                } else {
+                    (&mut self.phase2_draws, &mut self.phase2_pages)
+                };
+                let start = draws.len();
+                let instances = u32::from(first_phase);
+                let mut indices = 0;
+                facing_group_from(
+                    &s.sides,
+                    group,
+                    eye,
+                    mirror_low,
+                    v.origin,
+                    |first, quads| {
+                        indices += quads * 6;
+                        let base = s.start as u32 + first * 4;
+                        draws.push([quads * 6, instances, 0, base, i as u32]);
+                        pages.push((s.page, None));
+                    },
+                );
+                let runs = if first_phase {
+                    &mut self.solid_runs
+                } else {
+                    &mut self.phase2_runs
+                };
+                runs.push(
+                    v.distance,
+                    s.page,
+                    start,
+                    draws.len() - start,
+                    [i as u32, v.slot, indices],
+                );
+                if let Some(c) = &mut cull
+                    && first_phase
+                {
+                    c.drawn(i, v.slot, indices);
+                }
+            }
+            self.solid_runs
+                .regroup(&mut self.draws, &mut self.draw_pages, group_start);
+            if matches!(group, SolidGroup::Opaque) {
+                opaque_draws = self.draws.len() as u32;
             }
         }
-        self.solid_runs
-            .regroup(&mut self.draws, &mut self.draw_pages, 0);
         // Phase 2's draws are tested where grouping left them.
         let runs = self
             .phase2_runs
@@ -6705,6 +6746,19 @@ impl Renderer {
                                 phase1_draws,
                                 phase1_draws,
                                 solid_draws - phase1_draws,
+                            );
+                        }
+                        // A shader pack's material draws them all alike.
+                        None if opaque_draws > 0 && material.is_none() => {
+                            pass.set_pipeline(&self.solid_opaque);
+                            self.draw_sections(&mut pass, &self.indirect, 0, 0, opaque_draws);
+                            pass.set_pipeline(solid_pipeline);
+                            self.draw_sections(
+                                &mut pass,
+                                &self.indirect,
+                                0,
+                                opaque_draws,
+                                solid_draws - opaque_draws,
                             );
                         }
                         None => self.draw_sections(&mut pass, &self.indirect, 0, 0, solid_draws),
@@ -7961,16 +8015,48 @@ fn facing_runs_from(
     eye: Option<Vec3>,
     low: Option<f32>,
     origin: [f32; 3],
+    draw: impl FnMut(u32, u32),
+) {
+    facing_group_from(sides, SolidGroup::All, eye, low, origin, draw);
+}
+/// Which of a mesh's solid quads a draw takes.
+#[derive(Clone, Copy)]
+enum SolidGroup {
+    All,
+    /// Those over opaque texels (`mesher/sides.rs`).
+    Opaque,
+    /// The others.
+    Rest,
+}
+/// `facing_runs_from` over one group of the quads.
+fn facing_group_from(
+    sides: &Sides,
+    group: SolidGroup,
+    eye: Option<Vec3>,
+    low: Option<f32>,
+    origin: [f32; 3],
     mut draw: impl FnMut(u32, u32),
 ) {
     match eye {
         Some(eye) => {
             let eye = eye - Vec3::from(origin);
             let low = low.map_or(eye.y, |y| (y - origin[1]).min(eye.y));
-            sides.visible_from(eye.to_array(), low, draw)
+            match group {
+                SolidGroup::All => sides.visible_from(eye.to_array(), low, draw),
+                SolidGroup::Opaque => sides.opaque_from(eye.to_array(), low, draw),
+                SolidGroup::Rest => sides.rest_from(eye.to_array(), low, draw),
+            }
         }
-        None if sides.quads() > 0 => draw(0, sides.quads()),
-        None => {}
+        None => {
+            let (first, quads) = match group {
+                SolidGroup::All => (0, sides.quads()),
+                SolidGroup::Opaque => (0, sides.opaque_quads()),
+                SolidGroup::Rest => (sides.opaque_quads(), sides.quads() - sides.opaque_quads()),
+            };
+            if quads > 0 {
+                draw(first, quads);
+            }
+        }
     }
 }
 fn frustum(m: Mat4) -> [Vec4; 6] {
