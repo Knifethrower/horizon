@@ -2254,7 +2254,11 @@ impl Renderer {
                 (edge * edge * 4) as usize
             })
             .sum();
-        let mut animated_data = vec![0u8; chain * animated_count as usize];
+        // Padded like every array here: the count comes from the pack, and at a multiple of six
+        // OpenGL makes this a cube map array, which the shaders' 2D array sampler reads as opaque
+        // black. Vanilla's 54 layers are one.
+        let animated_texture_layers = array_layers(animated_count, gl);
+        let mut animated_data = vec![0u8; chain * animated_texture_layers as usize];
         for (dense, pixels) in animated_pixels.iter().enumerate() {
             if let Some(pixels) = pixels {
                 let start = dense * chain;
@@ -2269,7 +2273,7 @@ impl Renderer {
                 size: wgpu::Extent3d {
                     width: sprite_size,
                     height: sprite_size,
-                    depth_or_array_layers: animated_count,
+                    depth_or_array_layers: animated_texture_layers,
                 },
                 mip_level_count: sprite_levels,
                 sample_count: 1,
