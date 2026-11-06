@@ -2304,6 +2304,28 @@ fn region_path(root: &Path, folder: &str, rx: i32, rz: i32) -> PathBuf {
     root.join(format!("{folder}/r.{rx}.{rz}.mca"))
 }
 
+/// How many abandoned proto chunks may wait for the writer together: one per 128 MiB of RAM, and no
+/// limit from 32 on, where memory is no concern. Read once.
+fn proto_save_batch() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+        proto_batch_for(total)
+    })
+}
+fn proto_batch_for(total: Option<u64>) -> usize {
+    total.map_or(usize::MAX, |bytes| match usize::try_from(bytes >> 27) {
+        Ok(n) if n < 32 => n.max(1),
+        _ => usize::MAX,
+    })
+}
+
 /// A record waiting for the writer thread.
 #[derive(Clone)]
 enum Record {
@@ -5404,15 +5426,23 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
         self.save
             .tables
             .get_or_init(|| Arc::new(SaveTables::new(&self.registry)));
-        let saved: Vec<SavedProto> = protos
-            .iter()
-            .filter_map(|p| self.inner.saved_proto(p))
-            .collect();
-        if let Err(e) = self
-            .save
-            .save_protos(saved, self.registry.registry, &self.biomes)
-        {
-            log::warn!("Horizon: failed to save proto chunks: {e}");
+        // Leaving an area abandons many at once, and each waits for the writer in memory as its saved
+        // copy. A machine with little RAM waits for each batch to reach the disk before copying the next.
+        let batch = proto_save_batch();
+        let wait = protos.len() > batch;
+        for part in protos.chunks(batch) {
+            let saved: Vec<SavedProto> = part
+                .iter()
+                .filter_map(|p| self.inner.saved_proto(p))
+                .collect();
+            let written = self
+                .save
+                .save_protos(saved, self.registry.registry, &self.biomes)
+                .and_then(|()| if wait { self.save.flush() } else { Ok(()) });
+            if let Err(e) = written {
+                log::warn!("Horizon: failed to save proto chunks: {e}");
+                return;
+            }
         }
     }
     fn save_finished(&self, mut chunk: Chunk) {
