@@ -187,7 +187,7 @@ impl Game<'_> {
             .ok_or_else(|| format!("unknown block {name}"))?;
         let mut properties: BTreeMap<String, String> = registry
             .state(base)
-            .map(|s| s.properties.clone().into_iter().collect())
+            .map(|s| (*s.properties).clone())
             .unwrap_or_default();
         for kv in props.split(',').filter(|s| !s.is_empty()) {
             let (k, v) = kv.split_once('=').ok_or("property")?;
@@ -195,7 +195,7 @@ impl Game<'_> {
         }
         Ok(registry.resolve(&BlockState {
             name: name.to_owned(),
-            properties,
+            properties: properties.into(),
         })?)
     }
 

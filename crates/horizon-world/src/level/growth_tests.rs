@@ -121,7 +121,8 @@ impl World {
             properties: props
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<BTreeMap<_, _>>(),
+                .collect::<BTreeMap<_, _>>()
+                .into(),
         };
         self.f
             .registry

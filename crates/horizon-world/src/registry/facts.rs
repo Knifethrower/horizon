@@ -66,11 +66,11 @@ impl<'de> Deserialize<'de> for State {
         Ok(State(match Shape::deserialize(deserializer)? {
             Shape::Name(name) => BlockState {
                 name,
-                properties: BTreeMap::new(),
+                properties: Default::default(),
             },
             Shape::Full { id, properties } => BlockState {
                 name: id,
-                properties,
+                properties: properties.into(),
             },
         }))
     }

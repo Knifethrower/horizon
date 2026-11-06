@@ -92,7 +92,15 @@ impl BlockRegistry {
             collided: BTreeMap::new(),
             defaults: BTreeMap::new(),
         };
-        for (i, state) in states.into_iter().enumerate() {
+        // One map per distinct set of properties: most states share theirs with another block's.
+        let mut shared = std::collections::HashSet::new();
+        for (i, mut state) in states.into_iter().enumerate() {
+            match shared.get(&state.properties) {
+                Some(same) => state.properties = crate::chunk::Properties::clone(same),
+                None => {
+                    shared.insert(state.properties.clone());
+                }
+            }
             if result.id(&state).is_some() {
                 return Err(invalid("duplicate block registry state"));
             }

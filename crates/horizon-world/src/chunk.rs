@@ -12,7 +12,7 @@ use horizon_core::{
     storage::PackedStorage,
     ticks::{ChunkTicks, SavedTick, TickTypeId},
 };
-use std::{collections::BTreeMap, io};
+use std::{collections::BTreeMap, io, sync::Arc};
 
 fn key(value: &str) -> JavaString {
     JavaString::from(value)
@@ -158,10 +158,79 @@ impl PalettedContainer {
     }
 }
 
+/// A block state's properties: a map behind a shared pointer. Most states have the same
+/// properties as a state of another block, every stairs block's as the next one's, and an empty
+/// map's node alone is hundreds of bytes per state. Reads go through to the map; a write copies it
+/// if another state shares it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Properties(Arc<BTreeMap<String, String>>);
+impl std::ops::Deref for Properties {
+    type Target = BTreeMap<String, String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Properties {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+impl From<BTreeMap<String, String>> for Properties {
+    fn from(map: BTreeMap<String, String>) -> Self {
+        Self(Arc::new(map))
+    }
+}
+impl<const N: usize> From<[(String, String); N]> for Properties {
+    fn from(entries: [(String, String); N]) -> Self {
+        BTreeMap::from(entries).into()
+    }
+}
+impl FromIterator<(String, String)> for Properties {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(entries: I) -> Self {
+        entries.into_iter().collect::<BTreeMap<_, _>>().into()
+    }
+}
+impl<'a> IntoIterator for &'a Properties {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::collections::btree_map::Iter<'a, String, String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+#[cfg(test)]
+mod properties_tests {
+    use super::*;
+    #[test]
+    fn a_write_leaves_the_state_it_shared_with_alone() {
+        let first = Properties::from([("half".to_owned(), "top".to_owned())]);
+        let mut second = first.clone();
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        second.insert("half".to_owned(), "bottom".to_owned());
+        assert!(!Arc::ptr_eq(&first.0, &second.0));
+        assert_eq!(first["half"], "top");
+        assert_eq!(second["half"], "bottom");
+    }
+}
+impl PartialEq<BTreeMap<String, String>> for Properties {
+    fn eq(&self, other: &BTreeMap<String, String>) -> bool {
+        *self.0 == *other
+    }
+}
+impl<'de> serde::Deserialize<'de> for Properties {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        BTreeMap::deserialize(deserializer).map(Self::from)
+    }
+}
+impl serde::Serialize for Properties {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BlockState {
     pub name: String,
-    pub properties: BTreeMap<String, String>,
+    pub properties: Properties,
 }
 impl BlockState {
     pub fn to_nbt(&self) -> Tag {
@@ -184,7 +253,7 @@ impl BlockState {
         if let Tag::String(name) = tag {
             return Ok(Self {
                 name: name.to_string().map_err(|e| invalid(e.to_string()))?,
-                properties: BTreeMap::new(),
+                properties: Properties::default(),
             });
         }
         let Some(Tag::String(name)) = tag.get("id") else {
@@ -207,7 +276,7 @@ impl BlockState {
         }
         Ok(Self {
             name: name.to_string().map_err(|e| invalid(e.to_string()))?,
-            properties,
+            properties: properties.into(),
         })
     }
 }
