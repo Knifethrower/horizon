@@ -2108,6 +2108,28 @@ fn region_path(root: &Path, folder: &str, rx: i32, rz: i32) -> PathBuf {
     root.join(format!("{folder}/r.{rx}.{rz}.mca"))
 }
 
+/// How many abandoned proto chunks may wait for the writer together: one per 128 MiB of RAM, and no
+/// limit from 32 on, where memory is no concern. Read once.
+fn proto_save_batch() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+        proto_batch_for(total)
+    })
+}
+fn proto_batch_for(total: Option<u64>) -> usize {
+    total.map_or(usize::MAX, |bytes| match usize::try_from(bytes >> 27) {
+        Ok(n) if n < 32 => n.max(1),
+        _ => usize::MAX,
+    })
+}
+
 /// A record waiting for the writer thread.
 #[derive(Clone)]
 enum Record {
@@ -2509,14 +2531,21 @@ impl SaveDir {
         biomes: &Biomes,
     ) -> Result<()> {
         let tables = self.tables.get().map(|t| &**t);
-        let records = protos
-            .iter()
-            .map(|p| {
-                let tag = encode_proto(p, registry, biomes, tables, self.shape);
-                ((p.column.x, p.column.z), Some(tag))
-            })
-            .collect();
-        self.write_records("region", records, false)
+        // Leaving an area abandons many at once, and each waits for the writer as a whole NBT tree.
+        // A machine with little RAM waits for each batch to reach the disk instead.
+        let batch = proto_save_batch();
+        let wait = protos.len() > batch;
+        for part in protos.chunks(batch) {
+            let records = part
+                .iter()
+                .map(|p| {
+                    let tag = encode_proto(p, registry, biomes, tables, self.shape);
+                    ((p.column.x, p.column.z), Some(tag))
+                })
+                .collect();
+            self.write_records("region", records, wait)?;
+        }
+        Ok(())
     }
     /// Entities saved for a chunk (`entities/`; older chunks may still keep
     /// them in the chunk's own `entities` list).
