@@ -355,14 +355,45 @@ struct Shared {
     meshes: Mutex<MeshPool>,
     aborted: std::sync::atomic::AtomicBool,
 }
-#[derive(Default)]
 struct MeshPool {
     meshes: Vec<SectionMesh>,
     bytes: usize,
+    /// What it may hold: [`MeshPool::BYTES`], or [`MeshPool::RAM_SHARE`] of a smaller machine's RAM.
+    most: usize,
+}
+impl Default for MeshPool {
+    fn default() -> Self {
+        Self {
+            meshes: Vec::new(),
+            bytes: 0,
+            most: Self::BYTES,
+        }
+    }
 }
 impl MeshPool {
     const BYTES: usize = 16 << 20;
     const COUNT: usize = 128;
+    /// The pool only saves reallocating while chunks arrive, and on a machine with little RAM
+    /// its full size is memory the world needs: a share of that RAM is plenty.
+    const RAM_SHARE: u64 = 256;
+    fn sized_for_this_machine() -> Self {
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+        Self {
+            most: Self::most_for(total),
+            ..Self::default()
+        }
+    }
+    fn most_for(total: Option<u64>) -> usize {
+        total.map_or(Self::BYTES, |bytes| {
+            usize::try_from(bytes / Self::RAM_SHARE).map_or(Self::BYTES, |share| share.min(Self::BYTES))
+        })
+    }
     fn take(&mut self) -> SectionMesh {
         let mesh = self.meshes.pop().unwrap_or_default();
         self.bytes -= mesh.capacity_bytes();
@@ -371,7 +402,7 @@ impl MeshPool {
     /// A rejected mesh is dropped by the caller, after releasing the lock.
     fn put(&mut self, mut mesh: SectionMesh) -> Option<SectionMesh> {
         let bytes = mesh.capacity_bytes();
-        if bytes == 0 || self.meshes.len() == Self::COUNT || bytes > Self::BYTES - self.bytes {
+        if bytes == 0 || self.meshes.len() == Self::COUNT || bytes > self.most - self.bytes {
             return Some(mesh);
         }
         mesh.clear();
@@ -952,7 +983,11 @@ impl<G: ChunkGenerator> Source for Jobs<G> {
     fn all_idle(&self) {
         // No worker needs retained mesh capacity now. Drop it outside the
         // pool lock; the pool then asks the allocator to return freed pages.
-        let meshes = std::mem::take(&mut *self.shared.meshes.lock().unwrap());
+        let meshes = {
+            let mut pool = self.shared.meshes.lock().unwrap();
+            pool.bytes = 0;
+            std::mem::take(&mut pool.meshes)
+        };
         drop(meshes);
         self.generator.all_idle();
     }
@@ -1078,7 +1113,7 @@ impl Streaming {
             queue: Mutex::new(BinaryHeap::new()),
             context: RwLock::new(context.clone()),
             done: Mailbox::default(),
-            meshes: Mutex::new(MeshPool::default()),
+            meshes: Mutex::new(MeshPool::sized_for_this_machine()),
             aborted: std::sync::atomic::AtomicBool::new(false),
         });
         let light_tables = context.light.clone();
@@ -3316,6 +3351,14 @@ mod tests {
         );
         assert_eq!(lit.sections[2].light.get(0), 0xF0);
         assert!(Arc::ptr_eq(&lit.sections[1], &old.sections[1]));
+    }
+
+    #[test]
+    fn mesh_pool_takes_a_share_of_a_small_machines_ram() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(MeshPool::most_for(None), MeshPool::BYTES);
+        assert_eq!(MeshPool::most_for(Some(16 * GIB)), MeshPool::BYTES);
+        assert_eq!(MeshPool::most_for(Some(GIB)), 4 << 20);
     }
 
     #[test]
