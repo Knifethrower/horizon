@@ -162,9 +162,9 @@ fn keep_heights(
     sections: &[Arc<Section>],
     maps: &ColumnHeightmaps,
 ) {
-    if heights.len() >= CACHE_SWEEP / 4 {
+    if heights.len() >= cache_sweep() / 4 {
         heights.retain(|_, h| h.sections.iter().all(|w| w.strong_count() > 0));
-        if heights.len() >= CACHE_SWEEP / 8 {
+        if heights.len() >= cache_sweep() / 8 {
             heights.clear();
         }
     }
@@ -312,6 +312,29 @@ impl SectionCoder {
 
 /// Sections kept before the ones no longer resident are dropped.
 const CACHE_SWEEP: usize = 1 << 15;
+/// [`CACHE_SWEEP`], or what a share of a smaller machine's RAM holds. A section's entry keeps its
+/// light (4 KiB) and its encoded blocks after the section has left the world, so a player exploring
+/// reaches the full count at over 100 MiB, which a machine with little RAM doesn't have. Read once.
+fn cache_sweep() -> usize {
+    static SWEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SWEEP.get_or_init(|| {
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+        sweep_for(total)
+    })
+}
+fn sweep_for(total: Option<u64>) -> usize {
+    const RAM_SHARE: u64 = 64;
+    const SECTION_BYTES: u64 = 5 << 10;
+    total.map_or(CACHE_SWEEP, |bytes| {
+        usize::try_from(bytes / RAM_SHARE / SECTION_BYTES).map_or(CACHE_SWEEP, |n| n.min(CACHE_SWEEP))
+    })
+}
 
 /// Uncached sections below which a batch is encoded on the tick's thread
 /// alone: waking the warm-up threads costs more than a few sections.
@@ -527,9 +550,9 @@ impl ChunkEncoder {
         cache: &'a mut FxHashMap<usize, Encoded>,
         section: &Arc<Section>,
     ) -> &'a mut Encoded {
-        if cache.len() >= CACHE_SWEEP {
+        if cache.len() >= cache_sweep() {
             cache.retain(|_, e| e.section.strong_count() > 0);
-            if cache.len() >= CACHE_SWEEP / 2 {
+            if cache.len() >= cache_sweep() / 2 {
                 cache.clear();
             }
         }
