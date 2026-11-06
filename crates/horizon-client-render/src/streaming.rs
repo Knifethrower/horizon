@@ -439,6 +439,28 @@ fn decoration_queue(
     std::collections::BinaryHeap::from(ranked)
 }
 
+/// Mesh jobs queued per worker, where memory is no concern.
+const MESH_JOBS_PER_WORKER: usize = 32;
+/// [`MESH_JOBS_PER_WORKER`], or fewer on a machine with little RAM: one per 128 MiB of it. Read once.
+fn mesh_jobs_per_worker() -> usize {
+    static JOBS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *JOBS.get_or_init(|| {
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+        mesh_jobs_for(total)
+    })
+}
+fn mesh_jobs_for(total: Option<u64>) -> usize {
+    total.map_or(MESH_JOBS_PER_WORKER, |bytes| {
+        usize::try_from(bytes >> 27).map_or(MESH_JOBS_PER_WORKER, |n| n.clamp(2, MESH_JOBS_PER_WORKER))
+    })
+}
+
 /// Finished jobs, from the workers to the game thread, in the order they
 /// finished. Not an `mpsc` channel: its receiver waits for a sender it finds
 /// half way through a send, and a worker descheduled there on a busy machine
@@ -2126,8 +2148,12 @@ impl Streaming {
         // capacity frees; `requeue` then has a small queue to keep close.
         // Meshes waiting for upload count too: when uploads fall behind (a
         // low frame rate at a wide distance), meshing on held gigabytes of
-        // them until the system swapped.
-        let room = (self.workers * 32).saturating_sub(self.meshing.len() + self.upload_backlog);
+        // them until the system swapped. On a machine with little RAM a
+        // worker queues fewer jobs (`mesh_jobs_per_worker`): finished meshes
+        // arrive faster than a slow GPU takes them, and each holds its
+        // vertices in memory.
+        let room = (self.workers * mesh_jobs_per_worker())
+            .saturating_sub(self.meshing.len() + self.upload_backlog);
         nearest_first(&mut candidates, room);
         for (_, x, z, sections) in candidates.drain(..) {
             let Some(region) = Self::region(world, x, z) else {
@@ -3351,6 +3377,15 @@ mod tests {
         );
         assert_eq!(lit.sections[2].light.get(0), 0xF0);
         assert!(Arc::ptr_eq(&lit.sections[1], &old.sections[1]));
+    }
+
+    #[test]
+    fn mesh_jobs_follow_the_ram_where_it_is_small() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(mesh_jobs_for(None), MESH_JOBS_PER_WORKER);
+        assert_eq!(mesh_jobs_for(Some(16 * GIB)), MESH_JOBS_PER_WORKER);
+        assert_eq!(mesh_jobs_for(Some(GIB)), 8);
+        assert_eq!(mesh_jobs_for(Some(GIB / 8)), 2);
     }
 
     #[test]
