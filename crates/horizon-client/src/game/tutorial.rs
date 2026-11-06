@@ -82,6 +82,11 @@ impl Tutorial {
         true
     }
 
+    /// The tutorial is over, as when its last step ends. Returns whether the persisted step changed.
+    pub(super) fn finish(&mut self) -> bool {
+        self.set_step(Step::None)
+    }
+
     pub(super) fn input(&mut self) {
         self.moved = true;
     }
@@ -255,6 +260,14 @@ impl super::Game<'_> {
             || self.options.dedicated.is_some()
             || self.serving.is_some()
         {
+            return;
+        }
+        // Its hints name the keyboard and the mouse, and a stick's turning doesn't count as looking
+        // around, so with a pad its first step could never end.
+        if self.pad.in_use {
+            if self.tutorial.finish() {
+                self.persist_tutorial_step();
+            }
             return;
         }
         if self.screen == super::Screen::Playing
