@@ -606,20 +606,36 @@ static COMMAND_EXPORTS: Mutex<Vec<(PathBuf, Option<Arc<Registries>>)>> = Mutex::
 /// (vanilla's built-in registries), read once like the resource ids: parsing
 /// its 1.6 MB again took about 15 ms of every world opening. Only the part
 /// the registries fill from stays, not the parsed export (4.2 MB, against
-/// 2.2 MB). A dedicated server opens its world once and keeps nothing.
+/// 2.2 MB). A dedicated server opens its world once and keeps nothing, nor
+/// does a machine with little RAM ([`export_worth_keeping`]).
 fn command_export(dir: &Path, keep: bool) -> Option<Arc<Registries>> {
     let mut cache = COMMAND_EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, export)) = cache.iter().find(|(cached, _)| cached == dir) {
         return export.clone();
     }
-    let export = std::fs::read(dir.join("command-registries.json"))
-        .ok()
+    let bytes = std::fs::read(dir.join("command-registries.json")).ok();
+    let size = bytes.as_ref().map_or(0, Vec::len) as u64;
+    let export = bytes
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .map(|export| Arc::new(Registries::from_export(&export)));
-    if keep {
+    let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+        t.lines().find_map(|line| {
+            let rest = line.strip_prefix("MemTotal:")?;
+            let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            Some(kib * 1024)
+        })
+    });
+    if keep && export_worth_keeping(size, total) {
         cache.push((dir.to_owned(), export.clone()));
     }
     export
+}
+
+/// Whether an export's registries stay in memory for the next world: not on a machine where three
+/// times its file is more than a 256th of the RAM (for the 1.6 MB export, below about 1.2 GiB).
+/// Reading it again costs a fraction of a second at a world's opening.
+fn export_worth_keeping(file_bytes: u64, total_ram: Option<u64>) -> bool {
+    total_ram.is_none_or(|ram| file_bytes * 3 <= ram / 256)
 }
 
 /// The ids of the `.json` files in `data/<namespace>/<kind>` of every
@@ -2207,6 +2223,14 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_large_export_is_not_kept_on_a_small_machine() {
+        const GIB: u64 = 1 << 30;
+        assert!(export_worth_keeping(1_600_000, None));
+        assert!(export_worth_keeping(1_600_000, Some(8 * GIB)));
+        assert!(!export_worth_keeping(1_600_000, Some(GIB)));
     }
 
     /// The export is read once per folder; a folder without one stays without.
