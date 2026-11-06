@@ -261,12 +261,29 @@ fn command_export(dir: &Path) -> Option<Arc<serde_json::Value>> {
     if let Some((_, export)) = cache.iter().find(|(cached, _)| cached == dir) {
         return export.clone();
     }
-    let export = std::fs::read(dir.join("command-registries.json"))
-        .ok()
+    let bytes = std::fs::read(dir.join("command-registries.json")).ok();
+    let size = bytes.as_ref().map_or(0, Vec::len) as u64;
+    let export = bytes
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .map(Arc::new);
-    cache.push((dir.to_owned(), export.clone()));
+    let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+        t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+    if export_worth_keeping(size, total) {
+        cache.push((dir.to_owned(), export.clone()));
+    }
     export
+}
+
+/// Whether a parsed export stays in memory for the next world. Parsed, it takes about three times
+/// its file; not worth it where that's more than a 256th of the RAM: reading it again costs
+/// a fraction of a second at a world's opening.
+fn export_worth_keeping(file_bytes: u64, total_ram: Option<u64>) -> bool {
+    total_ram.is_none_or(|ram| file_bytes * 3 <= ram / 256)
 }
 
 /// The `minecraft:` ids of the `extension` files under `root`, sorted.
@@ -1538,6 +1555,14 @@ mod tests {
         std::fs::write(recipe.join("c.json"), "{}").unwrap();
         assert!(Arc::ptr_eq(&first, &resource_ids(&root)));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_large_export_is_not_kept_on_a_small_machine() {
+        const GIB: u64 = 1 << 30;
+        assert!(export_worth_keeping(1_600_000, None));
+        assert!(export_worth_keeping(1_600_000, Some(8 * GIB)));
+        assert!(!export_worth_keeping(1_600_000, Some(GIB)));
     }
 
     /// The export is read once per folder; a folder without one stays without.
