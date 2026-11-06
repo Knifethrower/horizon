@@ -188,9 +188,9 @@ impl Default for SoundCache {
 /// The most the sound cache keeps, on a machine with RAM to spare.
 const CACHE_BYTES: usize = 64 << 20;
 /// The cache's share of the machine's RAM where [`CACHE_BYTES`] is more.
-const CACHE_RAM_SHARE: u64 = 32;
+const CACHE_RAM_SHARE: u64 = 64;
 /// The sound cache's budget on this device: [`CACHE_BYTES`], or a
-/// thirty-second of the machine's RAM when that is smaller. Every static sound
+/// sixty-fourth of the machine's RAM when that is smaller. Every static sound
 /// of a session decodes to 1.4 GiB of `f32`, so the cache fills to whatever it
 /// is given and stays there, beside a game that has no swap to fall back on on
 /// a 1 GB handheld. Past the budget a sound is decoded again the next time it
@@ -1737,9 +1737,9 @@ mod tests {
         const GIB: u64 = 1 << 30;
         assert_eq!(budget_for(None), CACHE_BYTES);
         assert_eq!(budget_for(Some(16 * GIB)), CACHE_BYTES);
-        assert_eq!(budget_for(Some(2 * GIB)), CACHE_BYTES);
-        assert_eq!(budget_for(Some(GIB)), 32 << 20);
-        assert_eq!(budget_for(Some(GIB / 2)), 16 << 20);
+        assert_eq!(budget_for(Some(4 * GIB)), CACHE_BYTES);
+        assert_eq!(budget_for(Some(GIB)), 16 << 20);
+        assert_eq!(budget_for(Some(GIB / 2)), 8 << 20);
     }
     /// A streamed sound plays sample for sample as the same sound decoded
     /// whole, and its decoder never runs more than a packet past `ahead`.
