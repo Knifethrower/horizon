@@ -497,7 +497,8 @@ fn source_chains(
         pixels: Vec::with_capacity((edge * edge) as usize * frames.len()),
     };
     for frame in frames {
-        let frame = crate::sprites::resample(frame, size, edge);
+        let side = (frame.len() / 4).isqrt() as u32;
+        let frame = crate::sprites::resample(frame, side, edge);
         sheet.pixels.extend_from_slice(frame.as_chunks::<4>().0);
     }
     let has_transparent = s.has_transparent || sheet.pixels.iter().any(|p| p[3] == 0);
@@ -658,7 +659,8 @@ mod tests {
         assert_eq!(sprites.animations.len(), 9);
         for animation in &sprites.animations {
             for frame in 0..animation.frame_count() {
-                let pixels = animation.pixels(frame);
+                let pixels = animation.resized_pixels(frame, 64, 64);
+                let pixels = &pixels[..];
                 let (expected, _) =
                     super::super::mip_chain(pixels, 64, &sprites.mips, animation.layer, 1);
                 let (chain, edge) = source_chain(pixels, 64, &sprites.mips, animation.layer);

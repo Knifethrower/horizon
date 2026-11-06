@@ -60,6 +60,8 @@ impl SpriteAnimation {
         }
         out
     }
+    /// A frame at the texture's own resolution: the array's size can be many times that, and the
+    /// frames are kept for the whole session.
     pub fn pixels(&self, frame: usize) -> &[u8] {
         &self.frames[frame]
     }
@@ -247,16 +249,10 @@ impl Sprites {
             self.size = size;
             return;
         }
-        let mut resized = Vec::with_capacity(self.native.len());
         self.pixels.clear();
         for (from, frames, initial) in &self.native {
-            let frames: Arc<Vec<Vec<u8>>> =
-                Arc::new(frames.iter().map(|f| resample(f, *from, size)).collect());
-            self.pixels.extend_from_slice(&frames[*initial]);
-            resized.push(frames);
-        }
-        for animation in &mut self.animations {
-            animation.frames = resized[animation.layer as usize].clone();
+            self.pixels
+                .extend_from_slice(&resample(&frames[*initial], *from, size));
         }
         self.size = size;
     }
