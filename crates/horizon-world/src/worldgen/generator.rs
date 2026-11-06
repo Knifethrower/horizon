@@ -944,6 +944,29 @@ pub struct FlatSettings {
     pub structure_overrides: Option<Vec<String>>,
 }
 const CACHE_LIMIT: usize = 16384;
+/// The most chunks' biomes [`Pipeline::biome_cache`] holds on this machine: [`CACHE_LIMIT`], or
+/// what a share of a smaller machine's RAM holds. At about 6 KiB a chunk the full cache is 100 MiB,
+/// which a player walking across a world reaches on a machine that doesn't have it to spare.
+fn biome_cache_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+        biome_limit_for(total)
+    })
+}
+fn biome_limit_for(total: Option<u64>) -> usize {
+    const RAM_SHARE: u64 = 128;
+    const CHUNK_BYTES: u64 = 6 << 10;
+    total.map_or(CACHE_LIMIT, |bytes| {
+        usize::try_from(bytes / RAM_SHARE / CHUNK_BYTES).map_or(CACHE_LIMIT, |n| n.min(CACHE_LIMIT))
+    })
+}
 /// Coordinates only equal missing neighbour keys. Weak entries retain no
 /// computed values across eviction or explicit invalidation. Only one work
 /// lock may be held at a time; finish shared prerequisites before acquiring it.
@@ -1334,7 +1357,7 @@ where
             .map_err(stage("biomes"))?;
         let chunk = Arc::new(chunk);
         let mut cache = self.biome_cache.lock().unwrap();
-        if cache.len() >= CACHE_LIMIT {
+        if cache.len() >= biome_cache_limit() {
             cache.clear();
         }
         cache.insert((pos.x, pos.z), chunk.clone());
@@ -4017,6 +4040,14 @@ mod tests {
     }
 
     #[test]
+    fn biome_cache_takes_a_share_of_a_small_machines_ram() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(biome_limit_for(None), CACHE_LIMIT);
+        assert_eq!(biome_limit_for(Some(16 * GIB)), CACHE_LIMIT);
+        assert_eq!(biome_limit_for(Some(GIB)), 1365);
+    }
+
+    #[test]
     fn local_carver_cache_is_worker_owned_and_eviction_preserves_terrain() {
         let root = std::env::var_os("HORIZON_RESOURCES")
             .map(std::path::PathBuf::from)
@@ -4353,7 +4384,7 @@ mod tests {
         {
             let mut cache = pipeline.biome_cache.lock().unwrap();
             cache.clear();
-            for x in 0..CACHE_LIMIT as i32 {
+            for x in 0..biome_cache_limit() as i32 {
                 cache.insert((x, 10000), biomes.clone());
             }
         }
