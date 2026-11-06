@@ -9,6 +9,25 @@ use std::{
 };
 
 pub const FILE: &str = "horizon-graphics.txt";
+
+/// The machine's RAM, where it says.
+fn ram_bytes() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+        t.lines().find_map(|line| {
+            let rest = line.strip_prefix("MemTotal:")?;
+            let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            Some(kib * 1024)
+        })
+    })
+}
+/// The automatic worker count's ceiling, one worker per 384 MiB: a generating worker holds its
+/// density buffers and the chunks it's on, and on a machine with little RAM a burst of new chunks on
+/// every worker at once is what runs out of memory.
+fn workers_the_ram_carries(total: Option<u64>) -> usize {
+    total.map_or(usize::MAX, |bytes| {
+        usize::try_from(bytes / (384 << 20)).map_or(usize::MAX, |n| n.max(1))
+    })
+}
 /// Written beside it before HDR output is switched on and removed once the first HDR frame is
 /// presented. Found at the next start, it means HDR output took the game down, so HDR starts off.
 pub const HDR_MARKER: &str = "horizon-hdr-pending";
@@ -632,7 +651,8 @@ impl Graphics {
         let auto = std::thread::available_parallelism()
             .map_or(2, |n| n.get())
             .saturating_sub(1)
-            .max(1);
+            .max(1)
+            .min(workers_the_ram_carries(ram_bytes()));
         if self.battery { auto.div_ceil(2) } else { auto }
     }
     /// The frame cap battery mode adds: 60 in a world, 30 in menus without a
@@ -856,11 +876,26 @@ mod tests {
     }
 
     #[test]
+    fn automatic_workers_follow_the_ram_where_it_is_small() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(workers_the_ram_carries(None), usize::MAX);
+        assert_eq!(workers_the_ram_carries(Some(895 << 20)), 2);
+        assert_eq!(workers_the_ram_carries(Some(GIB / 4)), 1);
+        assert!(workers_the_ram_carries(Some(16 * GIB)) > 32);
+    }
+
+    #[test]
     fn automatic_workers_leave_a_core_as_vanilla_does() {
         let g = Graphics::default();
         assert_eq!(g.workers, 0);
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-        assert_eq!(g.worker_threads(), cores.saturating_sub(1).max(1));
+        assert_eq!(
+            g.worker_threads(),
+            cores
+                .saturating_sub(1)
+                .max(1)
+                .min(workers_the_ram_carries(ram_bytes()))
+        );
         // A manual count is the player's own choice, kept as asked.
         let manual = Graphics { workers: 3, ..g };
         assert_eq!(manual.worker_threads(), 3);
