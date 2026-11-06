@@ -341,6 +341,28 @@ impl MeshPool {
     }
 }
 
+/// Mesh jobs queued per worker, where memory is no concern.
+const MESH_JOBS_PER_WORKER: usize = 32;
+/// [`MESH_JOBS_PER_WORKER`], or fewer on a machine with little RAM: one per 128 MiB of it. Read once.
+fn mesh_jobs_per_worker() -> usize {
+    static JOBS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *JOBS.get_or_init(|| {
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+            t.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                Some(kib * 1024)
+            })
+        });
+        mesh_jobs_for(total)
+    })
+}
+fn mesh_jobs_for(total: Option<u64>) -> usize {
+    total.map_or(MESH_JOBS_PER_WORKER, |bytes| {
+        usize::try_from(bytes >> 27).map_or(MESH_JOBS_PER_WORKER, |n| n.clamp(2, MESH_JOBS_PER_WORKER))
+    })
+}
+
 /// Finished jobs, from the workers to the game thread, in the order they
 /// finished. Not an `mpsc` channel: its receiver waits for a sender it finds
 /// half way through a send, and a worker descheduled there on a busy machine
@@ -426,6 +448,8 @@ pub struct Streaming {
     saves_beside_final: bool,
     lighting: FxHashMap<(i32, i32), u64>,
     meshing: FxHashMap<(i32, i32, i32), u64>,
+    /// Finished meshes the game hasn't uploaded yet ([`Self::set_upload_backlog`]).
+    upload_backlog: usize,
     /// The sequence each section's latest accepted mesh was dispatched at
     /// (`CompiledSectionMesh.compileTaskStartTimeNs`).
     compile_started: FxHashMap<(i32, i32, i32), u64>,
@@ -855,6 +879,7 @@ impl Streaming {
             saves_beside_final: generator.decorates_beside_final(),
             lighting: Default::default(),
             meshing: Default::default(),
+            upload_backlog: 0,
             compile_started: Default::default(),
             lit: Default::default(),
             meshed: Default::default(),
@@ -950,6 +975,10 @@ impl Streaming {
     /// Freed in the frame, the hundreds of meshes a chunk border brings waited
     /// on the allocator behind every busy worker: up to 20 ms of a frame each
     /// time while flying at render distance 32.
+    /// How many finished meshes the game holds for later frames' uploads.
+    pub fn set_upload_backlog(&mut self, meshes: usize) {
+        self.upload_backlog = meshes;
+    }
     pub fn free(&mut self, meshes: Vec<((i32, i32, i32), SectionMesh)>) {
         if !meshes.is_empty() {
             self.submit(None, 0, Job::Free(meshes));
@@ -1708,7 +1737,15 @@ impl Streaming {
         // jobs went stale long before a worker reached them (#3629). What
         // stays dirty is asked for again, from the current centre, as
         // capacity frees; `requeue` then has a small queue to keep close.
-        let room = (self.threads.len() * 32).saturating_sub(self.meshing.len());
+        // Past that, on a machine with little RAM, finished meshes waiting for their upload count
+        // too: they arrive faster than a slow GPU takes them, and each holds its vertices in memory.
+        let per_worker = mesh_jobs_per_worker();
+        let waiting = if per_worker < MESH_JOBS_PER_WORKER {
+            self.upload_backlog
+        } else {
+            0
+        };
+        let room = (self.threads.len() * per_worker).saturating_sub(self.meshing.len() + waiting);
         nearest_first(&mut candidates, room);
         for (_, x, z, sections) in candidates {
             let Some(region) = Self::region(world, x, z) else {
@@ -2389,6 +2426,15 @@ fn nearest_first<T: Ord>(candidates: &mut Vec<T>, room: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_jobs_follow_the_ram_where_it_is_small() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(mesh_jobs_for(None), MESH_JOBS_PER_WORKER);
+        assert_eq!(mesh_jobs_for(Some(16 * GIB)), MESH_JOBS_PER_WORKER);
+        assert_eq!(mesh_jobs_for(Some(GIB)), 8);
+        assert_eq!(mesh_jobs_for(Some(GIB / 8)), 2);
+    }
 
     #[test]
     fn mesh_pool_takes_a_share_of_a_small_machines_ram() {

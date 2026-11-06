@@ -15509,6 +15509,7 @@ impl Game<'_> {
                 }
                 self.streaming.free(spent);
             }
+            self.streaming.set_upload_backlog(self.pending_uploads.len());
             renderer.remove_columns(unloaded.iter().map(|c| (c.x, c.z)));
             if let (Some(lod), Some(player)) = (&mut self.lod, &self.player) {
                 let lod_distance =
