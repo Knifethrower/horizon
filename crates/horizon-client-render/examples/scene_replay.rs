@@ -214,6 +214,7 @@ fn replay(window: Arc<Window>) -> Result<(), Box<dyn std::error::Error>> {
         &render.sprite_mips,
         &render.animations,
         (&one[..], 1, 1),
+        None,
         (&zero[..], 1, 1),
         (&zero[..], 1, 1),
         (&zero[..], 1),

@@ -786,6 +786,9 @@ pub fn shared_data_with(
     let started = std::time::Instant::now();
     let modified = biome_modifiers_over_packs(dir, overrides);
     let data = GeneratorData::load_with(dir, registry, modified.as_ref().unwrap_or(overrides))?;
+    // The bundles' parsed JSON is dropped by now, but the allocator keeps its pages mapped:
+    // give them back here, as horizon-world (a portable crate) cannot itself.
+    horizon_threads::release_free_memory();
     log::info!("Horizon: worldgen data loaded in {:?}", started.elapsed());
     for warning in data.warnings() {
         log::warn!("Horizon: data pack worldgen: {warning}");

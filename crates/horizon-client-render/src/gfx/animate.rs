@@ -153,18 +153,21 @@ impl SpriteAnimator {
             expression: &|_| None,
         }
     }
-    /// `textures` are the sprite arrays, `split` layers each, `size` pixels
-    /// wide; `animations` hold their frames at that size. `compute`: whether
-    /// the device says it runs compute shaders writing storage textures.
+    /// `texture` holds the animated sprites' layers, `size` pixels wide, and
+    /// `layer_index` maps a block sprite's layer to its layer there (or
+    /// `u32::MAX` when it does not animate); `animations` hold their frames at
+    /// that size. `compute`: whether the device says it runs compute shaders
+    /// writing storage textures.
     pub fn new(
         device: &wgpu::Device,
         animations: &[SpriteAnimation],
         size: u32,
         settings: &[Settings],
-        textures: &[wgpu::Texture],
-        split: u32,
+        texture: &wgpu::Texture,
+        layer_index: &[u32],
         compute: bool,
     ) -> Self {
+        let textures = std::slice::from_ref(texture);
         let pipeline = if compute { pipeline(device) } else { None };
         let limits = device.limits();
         let limit = if pipeline.is_some() {
@@ -181,6 +184,9 @@ impl SpriteAnimator {
         let mut counts: Vec<usize> = Vec::new();
         let mut sprites = Vec::with_capacity(animations.len());
         for animation in animations {
+            let Some(&dense) = layer_index.get(animation.layer as usize) else {
+                continue;
+            };
             let pixels: Vec<_> = (0..animation.frame_count())
                 .map(|frame| animation.pixels(frame))
                 .collect();
@@ -209,7 +215,7 @@ impl SpriteAnimator {
                     offset
                 })
                 .collect();
-            let key = (animation.layer / split, buffer);
+            let key = (0, buffer);
             let group = keys.iter().position(|&k| k == key).unwrap_or_else(|| {
                 keys.push(key);
                 counts.push(0);
@@ -219,7 +225,7 @@ impl SpriteAnimator {
             sprites.push(Sprite {
                 animation: animation.clone(),
                 shown: None,
-                layer: animation.layer % split,
+                layer: dense,
                 frames: offsets,
                 edge,
                 group,
@@ -602,9 +608,14 @@ fn source_chains(
         sheet.pixels.extend_from_slice(frame.as_chunks::<4>().0);
     }
     let has_transparent = s.has_transparent || sheet.pixels.iter().any(|p| p[3] == 0);
+    // The array's chains are as long as the option builds them (see
+    // `sprites::mip_cap`): a Mali pads every level of every layer.
+    let reduced = edge
+        .trailing_zeros()
+        .min(crate::sprites::mip_cap().saturating_sub(1));
     let levels = crate::mipmap::generate(
         sheet,
-        edge.trailing_zeros(),
+        reduced,
         Settings {
             has_transparent,
             ..s
@@ -917,7 +928,8 @@ mod tests {
         };
         let size = 32;
         // Layers 1 and 3: 8-pixel sprites with and without interpolation;
-        // layer 4: one at the array's size. Two layers per array.
+        // layer 4: one at the array's size. In an array of their own, in
+        // layer order (`layer_index`).
         let clips = [
             (
                 1,
@@ -938,29 +950,32 @@ mod tests {
                 crate::sprites::test_frames(layer, frames, metadata)
             })
             .collect();
-        let split = 2;
-        let textures: Vec<_> = (0..3)
-            .map(|_| {
-                device.create_texture(&wgpu::TextureDescriptor {
-                    label: None,
-                    size: wgpu::Extent3d {
-                        width: size,
-                        height: size,
-                        depth_or_array_layers: split,
-                    },
-                    mip_level_count: size.trailing_zeros() + 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::COPY_SRC
-                        | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                })
-            })
-            .collect();
-        let mut animator =
-            SpriteAnimator::new(&device, &animations, size, &mips, &textures, split, compute);
+        let layer_index = [u32::MAX, 0, u32::MAX, 1, 2];
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 3,
+            },
+            mip_level_count: size.trailing_zeros() + 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut animator = SpriteAnimator::new(
+            &device,
+            &animations,
+            size,
+            &mips,
+            &texture,
+            &layer_index,
+            compute,
+        );
         let mut uploads = Uploads::new(&device);
         let mut writes = Vec::new();
         for tick in [0, 0, 1, 2, 3, 4, 7, 7, 12, 30] {
@@ -984,13 +999,9 @@ mod tests {
                     .collect();
                 let (chains, edge) = source_chains(&pixels, size, &mips, animation.layer);
                 let (current, next) = (&chains[blend.frame], &chains[blend.next]);
-                let layers = read_back(
-                    &device,
-                    &queue,
-                    &textures[(animation.layer / split) as usize],
-                );
+                let layers = read_back(&device, &queue, &texture);
                 assert_eq!(
-                    layers[(animation.layer % split) as usize],
+                    layers[layer_index[animation.layer as usize] as usize],
                     reference(current, next, blend.millis, edge, size),
                     "layer {} at tick {tick}",
                     animation.layer
@@ -1026,8 +1037,31 @@ mod tests {
                 crate::sprites::test_frames(layer, frames, metadata)
             })
             .collect();
-        // Construct with CPU writer (empty textures is fine for collect testing)
-        let mut animator = SpriteAnimator::new(&device, &animations, size, &mips, &[], 2, false);
+        // Construct with CPU writer (an unwritten texture is fine for collect testing)
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 3,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let layer_index = [u32::MAX, 0, u32::MAX, 1, u32::MAX, 2];
+        let mut animator = SpriteAnimator::new(
+            &device,
+            &animations,
+            size,
+            &mips,
+            &texture,
+            &layer_index,
+            false,
+        );
         assert!(animator.is_animated(1));
         assert!(!animator.is_animated(2));
         assert!(animator.is_animated(3));

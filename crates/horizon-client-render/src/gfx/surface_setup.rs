@@ -134,6 +134,8 @@ pub(super) async fn open_adapter(
     // (`MC_GL_KHR_shader_subgroup_*`); storage buffers in vertex shaders, clearing and
     // atomics on images: their buffers and images. Filtering 32-bit float textures: shader
     // packs' RGBA32F buffers, which GL filters and mipmaps. Count draws: GPU culling's (`gpu_culling`).
+    // ASTC: sampling the baked texture caches this adapter can read (see `astc`); masked by
+    // `adapter.features()`, so a GPU without it simply keeps the RGBA textures.
     let features = timing::GpuTimer::features(adapter)
         | cull::Cull::features(adapter)
         | oit::features(adapter)
@@ -145,6 +147,7 @@ pub(super) async fn open_adapter(
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
                 | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
                 | wgpu::Features::RG11B10UFLOAT_RENDERABLE
+                | wgpu::Features::TEXTURE_COMPRESSION_ASTC
                 | wgpu::Features::SUBGROUP
                 | wgpu::Features::VERTEX_WRITABLE_STORAGE
                 | wgpu::Features::CLEAR_TEXTURE

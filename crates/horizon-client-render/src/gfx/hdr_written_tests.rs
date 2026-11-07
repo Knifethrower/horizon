@@ -351,7 +351,7 @@ impl<'a> Draw<'a> {
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let mut entries = vec![];
-        for binding in 0..if terrain { 13 } else { 8 } {
+        for binding in 0..if terrain { 15 } else { 8 } {
             let sampler = if terrain {
                 binding == 2 || binding == 4
             } else {
@@ -365,6 +365,13 @@ impl<'a> Draw<'a> {
                 }
             } else if sampler {
                 wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
+            } else if terrain && binding == 13 {
+                // terrain.wgsl's `layer_map`: no layer animates here.
+                wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                }
             } else {
                 wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -425,6 +432,27 @@ impl<'a> Draw<'a> {
         });
         let image = texture(1, &[200, 100, 50, alpha]).create_view(&Default::default());
         let threshold = texture(1, &[0, 0, 0, 0]).create_view(&Default::default());
+        let layer_map = device
+            .create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: 64,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: F::R32Uint,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                bytemuck::cast_slice(&[u32::MAX; 64]),
+            )
+            .create_view(&Default::default());
         let sampler = device.create_sampler(&Default::default());
         let resources: Vec<_> = entries
             .iter()
@@ -437,10 +465,10 @@ impl<'a> Draw<'a> {
                         view_dimension: wgpu::TextureViewDimension::D2Array,
                         ..
                     } => wgpu::BindingResource::TextureView(&array),
-                    _ => wgpu::BindingResource::TextureView(if entry.binding == 12 {
-                        &threshold
-                    } else {
-                        &image
+                    _ => wgpu::BindingResource::TextureView(match entry.binding {
+                        12 => &threshold,
+                        13 if terrain => &layer_map,
+                        _ => &image,
                     }),
                 },
             })
@@ -842,13 +870,14 @@ fn float_material_wrappers_keep_rgb_and_coverage_including_displacement() {
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         return;
     };
-    // The real material layout binds the terrain arrays and the pack's frame together.
-    if adapter.limits().max_sampled_textures_per_shader_stage < 19 {
+    // The real material layout binds the terrain arrays (the animated array and its layer map
+    // among them) and the pack's frame together.
+    if adapter.limits().max_sampled_textures_per_shader_stage < 21 {
         return;
     }
     let Ok((device, queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         required_limits: wgpu::Limits {
-            max_sampled_textures_per_shader_stage: 19,
+            max_sampled_textures_per_shader_stage: 21,
             ..Default::default()
         },
         ..Default::default()

@@ -120,6 +120,7 @@ fn fixture(window: Arc<Window>) -> Result<(), Box<dyn std::error::Error>> {
         &[],
         &[],
         (&white, 16, 16),
+        None,
         (&zero, 1, 1),
         (&zero, 1, 1),
         (&zero, 1),

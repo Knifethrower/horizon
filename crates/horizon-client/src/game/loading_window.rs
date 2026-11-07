@@ -52,6 +52,13 @@ pub(super) fn build_renderer(
     // Made here when the worker did not: the renderer's own fallback has no LabPBR maps.
     let prepared = Some(prepared.unwrap_or_else(|| prepare_renderer_textures(pack)));
     let atlas_pixels = atlas.pixels();
+    // Low memory: the pack's and the atlas's CPU temporaries are dead by now,
+    // but mimalloc holds freed pages. Give them back before a second renderer
+    // (its pipelines, and the world's 80 MiB atlas) is built beside the
+    // loading screen's on a device where both count against the process.
+    horizon_threads::release_free_memory();
+    log::info!("Horizon: building the renderer, rss {} MiB", rss_mib());
+    let build_started = std::time::Instant::now();
     let mut renderer = pollster::block_on(Renderer::new(
         window,
         offscreen,
@@ -62,6 +69,7 @@ pub(super) fn build_renderer(
         &assets.sprite_mips,
         &assets.animations,
         (&atlas_pixels, atlas.width, atlas.height),
+        gui.atlas_file.as_deref(),
         (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
         (
             &atlas.glint_armor.0,
@@ -79,6 +87,12 @@ pub(super) fn build_renderer(
         shader_pack.frame(),
         display,
     ))?;
+    horizon_threads::release_free_memory();
+    log::info!(
+        "Horizon: renderer built in {} ms, rss {} MiB",
+        build_started.elapsed().as_millis(),
+        rss_mib()
+    );
     renderer.hud.sprite_animations = atlas
         .sprite_animations
         .iter()
@@ -107,6 +121,7 @@ pub(super) fn loading_renderer(
     window: Arc<Window>,
     offscreen: bool,
     atlas: Option<&horizon_client::hud::HudAtlas>,
+    atlas_file: Option<&std::path::Path>,
     panorama: Option<&Arc<horizon_client::gfx::panorama::Faces>>,
     previous: Option<&Renderer>,
     api: horizon_client::graphics::GraphicsApi,
@@ -140,6 +155,7 @@ pub(super) fn loading_renderer(
         &[],
         &[],
         (pixels, width, height),
+        atlas_file,
         (glint_pixels, glint_width, glint_height),
         (glint_pixels, glint_width, glint_height),
         (&FORCEFIELD[..], 1),

@@ -154,6 +154,7 @@ impl Loading {
             Some(&self.boot),
             None,
             None,
+            None,
             self.settings.horizon.api,
         ) {
             Ok(r) => self.renderer = Some(r),
@@ -207,6 +208,50 @@ impl Loading {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // A world or a server to open at start (quick play, --world, --server)
+        // means the menu is never shown: the loading screen keeps the small
+        // boot atlas and the pack's atlas goes to the GPU when the world
+        // renderer is built. Uploading it here would hold its texture through
+        // the world's table loads, which is where a 1 GB console runs out.
+        let auto = self
+            .options
+            .as_ref()
+            .is_some_and(|o| o.world.is_some() || o.server.is_some());
+        // Nothing reads the packed pixels after the upload, so spill them to
+        // the game folder and drop the copy (80 MiB on the default resources)
+        // instead of carrying it beside the world's tables. The renderer
+        // streams the texture back from the file (`UiResources::atlas_file`).
+        if let Some(gui) = self.gui.as_mut()
+            && gui.atlas.pixels.len() > 8 << 20
+            && let Ok(dir) = std::env::current_dir()
+        {
+            let path = dir.join("cache").join(format!(
+                "hud-atlas-{}x{}.rgba",
+                gui.atlas.width, gui.atlas.height
+            ));
+            let written = path
+                .parent()
+                .is_none_or(|parent| std::fs::create_dir_all(parent).is_ok())
+                && std::fs::write(&path, &gui.atlas.pixels).is_ok();
+            if written {
+                gui.atlas_file = Some(path.clone());
+                gui.atlas.pixels = Vec::new();
+                gui.atlas.pixels.shrink_to_fit();
+                horizon_threads::release_free_memory();
+                log::info!(
+                    "Horizon: shared atlas spilled to {} and its CPU copy dropped, rss {} MiB",
+                    path.display(),
+                    rss_mib()
+                );
+            }
+        }
+        if auto {
+            log::info!(
+                "Horizon: quick play, the loading screen keeps the boot atlas, rss {} MiB",
+                rss_mib()
+            );
+            return;
+        }
         let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
@@ -217,6 +262,7 @@ impl Loading {
             window,
             offscreen,
             Some(&bundle.atlas),
+            bundle.atlas_file.as_deref(),
             Some(&bundle.panorama),
             self.renderer.as_ref(),
             self.settings.horizon.api,
@@ -224,6 +270,10 @@ impl Loading {
             Ok(r) => {
                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
                 self.renderer = Some(r);
+                log::info!(
+                    "Horizon: loading screen shows the pack atlas, rss {} MiB",
+                    rss_mib()
+                );
             }
             Err(e) => self.error = Some(e),
         }
@@ -305,6 +355,10 @@ impl Loading {
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
         }
+        // The core tables, the item models and the handoff left their parse
+        // buffers behind; give those pages back before the renderer's own
+        // peak (the sprite uploads and the title panorama) lands on them.
+        horizon_threads::release_free_memory();
         let renderer_at = Instant::now();
         let renderer = startup::time("renderer.world", || {
             build_renderer(
@@ -332,6 +386,8 @@ impl Loading {
             "Horizon: world renderer ready after {} ms",
             self.started.elapsed().as_millis()
         );
+        // The panorama's CPU faces and the prepared mip chains are gone now.
+        horizon_threads::release_free_memory();
         let renderer_ms = renderer_at.elapsed().as_millis();
         // Audio is created on the main thread, after the core is ready.
         let audio = if !options.execution_role.is_client() {

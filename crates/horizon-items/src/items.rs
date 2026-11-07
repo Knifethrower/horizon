@@ -372,6 +372,15 @@ thread_local! {
     /// inside itself (`LootContext.pushVisitedElement`).
     static NESTED_ROLLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+/// The process's resident set in MiB, for the load's memory logs.
+fn load_rss(stage: &str) {
+    let rss = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        .map(|pages| pages * 4 / 1024)
+        .unwrap_or(0);
+    eprintln!("Horizon: items {stage}, rss {rss} MiB");
+}
 pub struct Items {
     pub items: HashMap<Arc<str>, ItemInfo>,
     /// Default `minecraft:mob_visibility` by item id, with the `equippable`
@@ -1027,29 +1036,45 @@ impl Items {
             }
             order.push(id);
         }
+        load_rss("item defaults");
         // Every loot table, keyed by its id (blocks/stone, entities/sheep/white,
         // gameplay/chicken_lay, shearing/sheep/red...), of every namespace
         // (content mods' tables, docs/modpacks.md), with the packs' over the
         // game's own: one map with the loot data of the same root and packs.
-        let loot = horizon_world::loot::shared_tables(root, overlay)?;
+        // Parsed JSON is the load's biggest table set; `HORIZON_SKIP_LOOT`
+        // leaves it empty for a test that measures what it costs.
+        let loot = if std::env::var_os("HORIZON_SKIP_LOOT").is_some() {
+            Arc::default()
+        } else {
+            horizon_world::loot::shared_tables(root, overlay)?
+        };
+        load_rss("loot tables");
         let registry_order = registry_order(root, &order);
         set_villager_food(&items);
+        let block_tags = load_tags(root, "block", overlay)?;
+        let item_tags = load_tags(root, "item", overlay)?;
+        let item_tag_order = load_tag_lists(root, "item", overlay)?;
+        load_rss("tags");
+        let songs = load_songs(root);
+        let instruments = load_instruments(root);
+        let enchantments = Arc::new(crate::enchant::Enchantments::load_with_defaults(
+            root,
+            overlay,
+            Some(raw.as_ref()),
+        ));
+        load_rss("enchantments");
         Ok(Self {
             items,
             mob_visibility,
             order,
             registry_order,
-            block_tags: load_tags(root, "block", overlay)?,
-            item_tags: load_tags(root, "item", overlay)?,
-            item_tag_order: load_tag_lists(root, "item", overlay)?,
+            block_tags,
+            item_tags,
+            item_tag_order,
             loot,
-            songs: load_songs(root),
-            instruments: load_instruments(root),
-            enchantments: Arc::new(crate::enchant::Enchantments::load_with_defaults(
-                root,
-                overlay,
-                Some(raw.as_ref()),
-            )),
+            songs,
+            instruments,
+            enchantments,
         })
     }
     pub fn get(&self, id: &str) -> Option<&ItemInfo> {

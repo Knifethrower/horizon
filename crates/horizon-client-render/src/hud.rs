@@ -1467,7 +1467,7 @@ impl HudAtlas {
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut sprites = HashMap::new();
         let mut translucent = HashSet::new();
-        for ((name, w, h, data), (px, py)) in images.iter().zip(placements) {
+        for ((name, w, h, data), (px, py)) in images.drain(..).zip(placements) {
             if data
                 .as_chunks::<4>()
                 .0
@@ -1477,15 +1477,19 @@ impl HudAtlas {
                 translucent.insert(name.clone());
             }
             if !data.is_empty() {
-                for row in 0..*h {
+                for row in 0..h {
                     let src = &data[(row * w * 4) as usize..((row + 1) * w * 4) as usize];
                     let dst = (((py + row) * width + px) * 4) as usize;
                     pixels[dst..dst + (w * 4) as usize].copy_from_slice(src);
                 }
             }
-            let b = u32::from(bordered.contains(name));
+            // The image is in the atlas now: let it go before the next one is
+            // decoded into place, so the whole decoded set and the atlas never
+            // both sit in memory (tens of MiB of a 1 GB handheld's load peak).
+            drop(data);
+            let b = u32::from(bordered.contains(&name));
             let (px, py, w, h) = (px + b, py + b, w - 2 * b, h - 2 * b);
-            let (gw, gh) = gui_sizes.get(name).copied().unwrap_or((w, h));
+            let (gw, gh) = gui_sizes.get(&name).copied().unwrap_or((w, h));
             sprites.insert(
                 name.clone(),
                 Rect {
@@ -1498,6 +1502,9 @@ impl HudAtlas {
                 },
             );
         }
+        // The stitched atlas holds everything the images did; the decoded
+        // copies are 80 MiB of a handheld's RAM and nothing reads them again.
+        drop(images);
         // Every animated sprite animates: the packed strip is the raw first
         // frame, while the mcmeta's frame list may start anywhere, so each
         // animation's frame(0) overwrites its atlas rect before drawing.

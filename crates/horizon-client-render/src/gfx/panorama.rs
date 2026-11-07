@@ -327,6 +327,12 @@ impl Panorama {
     }
 
     fn cube(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::BindGroup {
+        log::info!(
+            "Horizon: title panorama {}x{}x6, {} MiB",
+            self.faces.size,
+            self.faces.size,
+            u64::from(self.faces.size) * u64::from(self.faces.size) * 6 * 4 / (1024 * 1024)
+        );
         let texture = device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {

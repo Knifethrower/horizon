@@ -111,6 +111,7 @@ impl UiResources {
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             Ok(Self {
                 atlas: atlas?,
+                atlas_file: None,
                 panorama: Arc::new(panorama),
             })
         })
@@ -120,6 +121,7 @@ impl UiResources {
     pub fn server(root: &std::path::Path) -> Result<Self> {
         Ok(Self {
             atlas: HudAtlas::fonts(root)?,
+            atlas_file: None,
             panorama: Arc::new(horizon_client::gfx::panorama::Faces::colour([0; 4])),
         })
     }

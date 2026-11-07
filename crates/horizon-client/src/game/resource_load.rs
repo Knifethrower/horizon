@@ -151,6 +151,7 @@ pub(super) struct GameplayTables {
 pub(super) fn load_core(
     root: &std::path::Path,
     headless: bool,
+    sprites: bool,
     parallel: bool,
     progress: &Progress,
     launch_world: Option<&str>,
@@ -192,10 +193,11 @@ pub(super) fn load_core(
             let assets = &assets;
             let render = Step::spawn(scope, parallel, "render", move || {
                 // A server reads no block sprites' pixels, which only the
-                // renderer draws (32 MB).
+                // renderer draws (32 MB). The bake runs without a window, but
+                // it packs the renderer's own arrays, so it asks for them.
                 let parsed_models = parsed_models;
                 let render = startup::time("core.block_models_sprites", || {
-                    if headless {
+                    if headless && !sprites {
                         assets.reload_for_server(root)
                     } else if let Some(parsed) = parsed_models {
                         assets.reload_with_models(root, parsed)
@@ -266,6 +268,7 @@ pub(super) fn load_core(
             )
         },
     );
+    horizon_threads::release_free_memory();
     // The packs' failure first: it rolls back whatever else failed.
     let (render, item_renderer, item_defaults) = match render {
         Ok(render) => render,
@@ -326,6 +329,7 @@ pub(super) fn gameplay_tables(
         .map_err(|e| e.to_string());
         (light.join(), motion)
     });
+    horizon_threads::release_free_memory();
     Ok(GameplayTables {
         light: light?,
         motion: motion?,
@@ -340,6 +344,34 @@ pub(super) fn gameplay_tables(
 /// the launch opens, whose data is preloaded meanwhile.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_resources(
+    root: PathBuf,
+    launch_world: Option<&str>,
+    vanilla_root: &std::path::Path,
+    settings: &Settings,
+    started: Instant,
+    menu: bool,
+    headless: bool,
+    progress: &Progress,
+    publish: &mut dyn FnMut(UiResources, &std::path::Path),
+) -> Result<Loaded> {
+    load_resources_with_sprites(
+        root,
+        launch_world,
+        vanilla_root,
+        settings,
+        started,
+        menu,
+        headless,
+        false,
+        progress,
+        publish,
+    )
+}
+
+/// [`load_resources`], where `sprites` reads the block sprites' pixels even
+/// when `headless`: `--bake-atlas` packs the renderer's arrays without a window.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn load_resources_with_sprites(
     mut root: PathBuf,
     launch_world: Option<&str>,
     vanilla_root: &std::path::Path,
@@ -347,6 +379,7 @@ pub(super) fn load_resources(
     started: Instant,
     menu: bool,
     headless: bool,
+    sprites: bool,
     progress: &Progress,
     publish: &mut dyn FnMut(UiResources, &std::path::Path),
 ) -> Result<Loaded> {
@@ -395,7 +428,7 @@ pub(super) fn load_resources(
                 // it waits for the core that loaded.
                 let early = launch_world.filter(|_| root == vanilla_root);
                 startup::time("core", || {
-                    load_core(&root, headless, parallel, progress, early)
+                    load_core(&root, headless, sprites, parallel, progress, early)
                 })
             });
             let ui = load_ui(&root).map(|ui| offer(ui, &root));
@@ -421,7 +454,11 @@ pub(super) fn load_resources(
         pack_error = Some(failure);
         root = vanilla_root.to_path_buf();
     };
-    log::info!("load core tables: {:.2}s", started.elapsed().as_secs_f32());
+    log::info!(
+        "load core tables: {:.2}s, rss {} MiB",
+        started.elapsed().as_secs_f32(),
+        rss_mib()
+    );
     let CoreTables {
         assets,
         entity_models,
@@ -461,7 +498,11 @@ pub(super) fn load_resources(
         Arc::new(light),
     );
     drop(pack_step);
-    log::info!("load pack tables: {:.2}s", started.elapsed().as_secs_f32());
+    log::info!(
+        "load pack tables: {:.2}s, rss {} MiB",
+        started.elapsed().as_secs_f32(),
+        rss_mib()
+    );
     progress.set(4);
     if !menu {
         horizon_client::ui::load_metadata(&root);
@@ -528,8 +569,9 @@ pub(super) fn load_resources(
                 progress.set(9);
                 horizon_client::telemetry::mark_rest_ready();
                 log::info!(
-                    "Horizon: rest-ready after {} ms",
-                    started.elapsed().as_millis()
+                    "Horizon: rest-ready after {} ms, rss {} MiB",
+                    started.elapsed().as_millis(),
+                    rss_mib()
                 );
                 write_prepared_files(vanilla_root);
                 Ok(())
@@ -584,8 +626,9 @@ pub(super) fn load_resources(
             }
         };
         log::info!(
-            "Horizon: handoff CPU resources prepared on worker in {} ms",
-            prepared_at.elapsed().as_millis()
+            "Horizon: handoff CPU resources prepared on worker in {} ms, rss {} MiB",
+            prepared_at.elapsed().as_millis(),
+            rss_mib()
         );
         (Some(game_cpu), Some(renderer_cpu))
     } else {
