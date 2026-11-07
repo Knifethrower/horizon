@@ -492,3 +492,10 @@ mod junction_tests {
         assert!(super::mount_point_buffer(&[0; 100]).is_ok());
     }
 }
+
+/// Sets an environment variable, for the first lines of `main` only: once another thread can read
+/// the environment, setting it isn't safe.
+pub fn set_env_before_threads(key: &str, value: &str) {
+    // SAFETY: the caller is `main`, before it has started a thread.
+    unsafe { std::env::set_var(key, value) };
+}

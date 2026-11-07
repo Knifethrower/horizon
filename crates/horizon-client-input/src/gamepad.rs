@@ -1159,9 +1159,26 @@ pub fn bow_power(ticks: u32) -> f32 {
     ((f * f + f * 2.0) / 3.0).min(1.0)
 }
 
+/// `SDL_GAMECONTROLLERCONFIG` with a mapping file's rows in it, or `None` when the file has none. The
+/// last row for a pad wins, so the variable's own rows stay ahead of the file's, as in SDL.
+pub fn sdl_config_with_file(file_rows: &str, config: Option<&str>) -> Option<String> {
+    if file_rows.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{file_rows}\n{}", config.unwrap_or("")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mapping_file_comes_before_the_variables_rows() {
+        assert_eq!(sdl_config_with_file("", None), None);
+        assert_eq!(sdl_config_with_file(" \n", Some("row")), None);
+        assert_eq!(sdl_config_with_file("file", None).as_deref(), Some("file\n"));
+        assert_eq!(sdl_config_with_file("file", Some("own")).as_deref(), Some("file\nown"));
+    }
 
     #[test]
     fn defaults_follow_bedrock() {
