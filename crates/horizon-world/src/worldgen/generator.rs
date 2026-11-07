@@ -458,6 +458,7 @@ impl GeneratorData {
             .into_iter()
             .filter_map(|(key, integer)| integer.then_some(key))
             .collect();
+        horizon_threads::release_free_memory();
         let biomes = read_bundle(dir, ov, "biomes")?;
         let biome_tags = build_tags(
             &read_bundle(dir, ov, "biome_tags")?,
@@ -492,6 +493,7 @@ impl GeneratorData {
         let source_catalog =
             BiomeSourceCatalog::new(&biome_set, &biome_tags, &presets.keys().cloned().collect())?;
         let carvers = CarverCatalog::from_json(&read_bundle(dir, ov, "carvers")?)?;
+        horizon_threads::release_free_memory();
         let mut biome_names = Vec::new();
         let mut biome_ids = BTreeMap::new();
         let mut biome_json = Vec::new();
@@ -529,6 +531,7 @@ impl GeneratorData {
             _ => None,
         };
         let structures = joined(structures)?;
+        horizon_threads::release_free_memory();
         let structure_resources = match (
             read_optional_bundle(dir, ov, "structures")?,
             read_optional_bundle(dir, ov, "structure_sets")?,
@@ -542,6 +545,7 @@ impl GeneratorData {
             _ => None,
         };
         let behaviours = joined(behaviours);
+        horizon_threads::release_free_memory();
         Ok(Arc::new(Self {
             behaviours,
             structure_resources,

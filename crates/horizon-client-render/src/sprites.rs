@@ -97,6 +97,65 @@ pub const SPRITE_SIZE: u32 = 16;
 /// Largest sprite array (all layers of the top mip level): resource packs
 /// with bigger textures are sampled down to fit.
 const MAX_ARRAY_BYTES: u64 = 256 << 20;
+/// The most one sprite array may take on this device: [`MAX_ARRAY_BYTES`],
+/// or a sixteenth of the machine's RAM when that is smaller. The array is
+/// copied once more for its upload and lives beside the world and the
+/// driver's own padding, so a resource pack's 256 MiB texture must not
+/// decide the cell on a 1 GB handheld. Read once; no env var.
+fn array_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let total = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|t| {
+                t.lines().find_map(|line| {
+                    let rest = line.strip_prefix("MemTotal:")?;
+                    let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                    Some(kib * 1024)
+                })
+            });
+        total
+            .map_or(MAX_ARRAY_BYTES, |bytes| (bytes / 16).clamp(16 << 20, MAX_ARRAY_BYTES))
+    })
+}
+/// The most mip levels a sprite array is built with: the Mipmap Levels
+/// option plus one (0: a single level), set when the options load.
+///
+/// A block sprite array costs its pixels once per level on a Mali whose
+/// driver pads every layer's every level: 16px, five levels and 256 layers
+/// are 57 MiB for 0.35 MiB of texels, one level 4 MiB. `mipmapLevels` 0,
+/// the low-memory option, is then also what vanilla means by it.
+static MIP_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// `mipmapLevels` from the options: 0 keeps one level, 4 builds five.
+pub fn set_mip_cap(mipmap_levels: i32) {
+    let levels = u32::try_from(mipmap_levels).unwrap_or(0).saturating_add(1);
+    set_mip_levels(levels);
+}
+/// The level count itself, for a caller whose count is not the option's: the
+/// bake covers the whole chain the format can hold, whatever the option says.
+pub fn set_mip_levels(levels: u32) {
+    MIP_CAP.store(levels.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+/// The built arrays' level count: the option's, capped by
+/// `HORIZON_SPRITE_MIPS` when a test sets it.
+pub(crate) fn mip_cap() -> u32 {
+    let env = std::env::var("HORIZON_SPRITE_MIPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(u32::MAX);
+    MIP_CAP.load(std::sync::atomic::Ordering::Relaxed).min(env).max(1)
+}
+/// A cell edge from `HORIZON_SPRITE_CELL` (dev only, like
+/// `HORIZON_SPRITE_SPLIT`): a hard cap on the array layers' size, for devices
+/// whose GPU memory counts against the process (a 1 GB handheld's Mali), where
+/// a cell picked by one big resource-pack texture costs hundreds of MB.
+fn requested_cell() -> Option<u32> {
+    std::env::var("HORIZON_SPRITE_CELL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| (SPRITE_SIZE..=4096).contains(&n))
+}
 /// Nearest-resample a square RGBA frame to another square size.
 pub(crate) fn resample(frame: &[u8], from: u32, to: u32) -> Vec<u8> {
     if from == to {
@@ -171,9 +230,17 @@ impl Sprites {
         let largest = self.native.iter().map(|n| n.0).max().unwrap_or(SPRITE_SIZE);
         self.minimum_size = self.native.iter().map(|n| n.0).min().unwrap_or(SPRITE_SIZE);
         let mut size = largest.max(SPRITE_SIZE).next_power_of_two();
-        while size > SPRITE_SIZE && layers * u64::from(size * size) * 4 > MAX_ARRAY_BYTES {
+        let budget = array_budget();
+        while size > SPRITE_SIZE && layers * u64::from(size * size) * 4 > budget {
             size /= 2;
         }
+        if let Some(cell) = requested_cell() {
+            size = size.min(cell.max(SPRITE_SIZE));
+        }
+        log::info!(
+            "Horizon: {layers} sprite layers at {size}px (largest {largest}px), {} MiB per top mip",
+            layers * u64::from(size * size) * 4 / (1024 * 1024)
+        );
         if !pixels {
             self.pixels = Vec::new();
             self.animations = Vec::new();

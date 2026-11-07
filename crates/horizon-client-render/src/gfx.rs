@@ -3,6 +3,7 @@
 //! world coordinates keep full precision.
 use crate::{
     Result,
+    astc,
     environment::Sky,
     graphics::GraphicsApi,
     hud::{HudBatch, HudRenderer},
@@ -615,6 +616,16 @@ pub struct Renderer {
     sprite_split: u32,
     /// A 1-layer array bound where a pack needs fewer arrays.
     sprite_unused: wgpu::TextureView,
+    /// The animated block sprites, in an array of their own: their layers are
+    /// rewritten every tick, and a compressed texture cannot be written, so
+    /// they stay out of `sprite_textures` (which can then be ASTC).
+    animated_view: wgpu::TextureView,
+    /// Block sprite layer -> its layer in `animated_sprites`, or `u32::MAX`
+    /// (a `R32Uint` texel per layer, read with `textureLoad`).
+    sprite_layers: wgpu::TextureView,
+    /// Whether the block sprite arrays are ASTC (no shader pack atlas then:
+    /// its copy would be compressed to uncompressed).
+    sprite_astc: bool,
     mip_levels: u32,
     /// The mipmap levels sampled (the Mipmap Levels option), at most `mip_levels - 1`.
     mipmaps: u32,
@@ -883,6 +894,8 @@ fn terrain_group(
     lightmap: &wgpu::TextureView,
     lightmap_sampler: &wgpu::Sampler,
     emission_thresholds: &wgpu::TextureView,
+    animated: &wgpu::TextureView,
+    layer_map: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     let view = |binding, view| wgpu::BindGroupEntry {
         binding,
@@ -914,6 +927,8 @@ fn terrain_group(
             view(10, &sprites[6]),
             view(11, &sprites[7]),
             view(12, emission_thresholds),
+            view(13, layer_map),
+            view(14, animated),
         ],
     })
 }
@@ -923,6 +938,8 @@ pub struct PreparedTextures {
     sprites: Vec<(Vec<u8>, u32)>,
     /// The sprite layers per array `sprites` is cut by.
     split: u32,
+    /// The sprite arrays' edge in pixels.
+    size: u32,
     forcefield: (Vec<u8>, u32),
 }
 impl PreparedTextures {
@@ -955,6 +972,7 @@ impl PreparedTextures {
                 })
                 .collect(),
             split,
+            size,
             forcefield: mip_chain(forcefield.0, forcefield.1, &[], 0, 1),
         }
     }
@@ -981,6 +999,21 @@ impl PreparedTextures {
         self.split = split;
         self
     }
+
+    /// Each packed sprite array, for baking its ASTC cache: `(array, edge,
+    /// layers, mip levels, the layer-major mip chain)`.
+    pub fn arrays(&self) -> impl Iterator<Item = (usize, u32, u32, u32, &[u8])> {
+        self.sprites.iter().enumerate().map(move |(array, (bytes, levels))| {
+            let chain: usize = (0..*levels)
+                .map(|level| {
+                    let edge = (self.size >> level).max(1) as usize;
+                    edge * edge * 4
+                })
+                .sum();
+            let layers = u32::try_from(bytes.len() / chain.max(1)).unwrap_or(1);
+            (array, self.size, layers, *levels, bytes.as_slice())
+        })
+    }
 }
 
 fn mip_chain(
@@ -990,8 +1023,27 @@ fn mip_chain(
     first: u32,
     layers: u32,
 ) -> (Vec<u8>, u32) {
-    let levels = size.trailing_zeros() + 1;
+    // `HORIZON_SPRITE_MIPS` caps the levels a sprite array is built with (dev
+    // only): a driver that pads every layer's every level can spend tens of
+    // MiB on an array whose pixels are one MiB.
+    let levels = (size.trailing_zeros() + 1)
+        .min(crate::sprites::mip_cap())
+        .max(1);
     let layer_bytes = (size * size * 4) as usize;
+    // A pack read for a server hands over no pixels: pad to the layers asked
+    // for instead of slicing past the end of an empty buffer.
+    let needed = layer_bytes * layers as usize;
+    let padded;
+    let pixels = if pixels.len() < needed {
+        padded = {
+            let mut bytes = pixels.to_vec();
+            bytes.resize(needed, 0);
+            bytes
+        };
+        &padded[..]
+    } else {
+        pixels
+    };
     // Exactly the chain's size: cached animation frames count their capacity.
     let chain_bytes: usize = (0..levels).map(|l| layer_bytes >> (2 * l)).sum();
     let mut out = Vec::with_capacity(chain_bytes * layers as usize);
@@ -1022,6 +1074,14 @@ fn mip_chain(
     }
     debug_assert_eq!(out.len(), chain_bytes * layers as usize);
     (out, levels)
+}
+/// The process's resident set in MiB, for logs written while memory matters.
+fn rss_mib_for_log() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        .map(|pages| pages * 4 / 1024)
+        .unwrap_or(0)
 }
 /// The wgpu instance options, without wgpu's validation of indirect draws
 /// in release builds. That validation (meant for untrusted WebGPU content)
@@ -1334,7 +1394,9 @@ async fn open_backend(
     // targets with the adapter's own format features) and R11F_G11F_B10F: a float
     // stand-in neither clamps nor drops NaN. Subgroups: shader packs' compute programs
     // (`MC_GL_KHR_shader_subgroup_*`); storage buffers in vertex shaders, clearing and
-    // atomics on images: their buffers and images.
+    // atomics on images: their buffers and images. ASTC: sampling the baked texture caches
+    // this adapter can read (see `astc`); masked by `adapter.features()`, so a GPU without
+    // it simply keeps the RGBA textures.
     let features = timing::GpuTimer::features(&adapter)
         | cull::Cull::features(&adapter)
         | oit::features(&adapter)
@@ -1344,6 +1406,7 @@ async fn open_backend(
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
                 | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
                 | wgpu::Features::RG11B10UFLOAT_RENDERABLE
+                | wgpu::Features::TEXTURE_COMPRESSION_ASTC
                 | wgpu::Features::SUBGROUP
                 | wgpu::Features::VERTEX_WRITABLE_STORAGE
                 | wgpu::Features::CLEAR_TEXTURE
@@ -1482,6 +1545,7 @@ impl Renderer {
         sprite_mips: &[crate::mipmap::Settings],
         animations: &[SpriteAnimation],
         hud_atlas: (&[u8], u32, u32),
+        hud_atlas_file: Option<&std::path::Path>,
         glint: (&[u8], u32, u32),
         glint_armor: (&[u8], u32, u32),
         forcefield: (&[u8], u32),
@@ -1680,6 +1744,18 @@ impl Renderer {
                         multisampled: false,
                     },
                 ),
+                // terrain.wgsl's `layer_map`: which layer of the animated array
+                // a block sprite has, or `u32::MAX` when it does not animate.
+                entry(
+                    13,
+                    vf,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                entry(14, vf, sprite_array),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1922,7 +1998,39 @@ impl Renderer {
             ),
         };
         let mut mip_levels = 1;
+        let sprite_levels = prepared.sprites.first().map_or(1, |(_, levels)| *levels);
         let gl = adapter.get_info().backend == wgpu::Backend::Gl;
+        // The cache dir the atlas spill lives in, for a baked ASTC array.
+        let cache_dir = hud_atlas_file.and_then(|path| path.parent());
+        // The bake has no adapter, so it wrote every layer into one file. The
+        // key is therefore the whole pack's, whether this adapter cut it into
+        // one array or six.
+        let baked_key = cache_dir.map(|_| {
+            astc::pack_key(
+                sprite_size,
+                prepared
+                    .sprites
+                    .iter()
+                    .map(|(mips, levels)| (mips.as_slice(), *levels)),
+            )
+        });
+        // The animated layers get an array of their own (below): they are the
+        // only layers the animator rewrites every tick, and a compressed
+        // texture cannot be written, so keeping them apart lets
+        // `sprite_textures` be ASTC. Their first frame must therefore come
+        // from the CPU pixels read here: a texture copy off the sprite arrays
+        // needs the two formats to match, and those arrays may be ASTC.
+        let mut animated_layers: Vec<u32> = animations
+            .iter()
+            .map(|animation| animation.layer)
+            .filter(|&layer| layer < layers)
+            .collect();
+        animated_layers.sort_unstable();
+        animated_layers.dedup();
+        // One layer-major chain per animated layer, in `animated_layers`
+        // order; `None` when this pack has no pixels for it.
+        let mut animated_pixels: Vec<Option<Vec<u8>>> = vec![None; animated_layers.len()];
+        let mut sprite_astc = true;
         let sprite_textures: Vec<wgpu::Texture> = prepared
             .sprites
             .into_iter()
@@ -1931,10 +2039,63 @@ impl Renderer {
                 let first = array as u32 * split;
                 let used = layers.saturating_sub(first).clamp(1, split);
                 let count = array_layers(used, gl);
+                mip_levels = levels;
+                // The levels of one layer are contiguous (layer major).
+                if !mips.is_empty() {
+                    let chain = mips.len() / used as usize;
+                    for (dense, &layer) in animated_layers.iter().enumerate() {
+                        if (first..first + used).contains(&layer) {
+                            let start = (layer - first) as usize * chain;
+                            animated_pixels[dense] = Some(mips[start..start + chain].to_vec());
+                        }
+                    }
+                }
+                // The baked copy of this pack, when the bake is there.
+                let baked = cache_dir.zip(baked_key).and_then(|(dir, key)| {
+                    let path = astc::find_array(dir, sprite_size, layers, key)?;
+                    let texture = astc::load_array(
+                        &device,
+                        &queue,
+                        &path,
+                        sprite_size,
+                        first,
+                        used,
+                        count,
+                        levels,
+                        "Block sprites (ASTC)",
+                    )?;
+                    log::info!(
+                        "Horizon: block sprite array {array} ({count} layers at {sprite_size}px, \
+                         {levels} mip levels) loaded from its ASTC bake, {} MiB, rss {} MiB",
+                        ((0..levels)
+                            .map(|level| {
+                                let edge = (sprite_size >> level).max(1);
+                                astc::encoded_len(edge, edge)
+                            })
+                            .sum::<u64>()
+                            * u64::from(count))
+                            / (1024 * 1024),
+                        rss_mib_for_log()
+                    );
+                    Some(texture)
+                });
+                if let Some(texture) = baked {
+                    return texture;
+                }
+                sprite_astc = false;
+                log::info!(
+                    "Horizon: block sprite array {array}: no usable ASTC bake for {sprite_size}px \
+                     at {levels} mip levels, uploading RGBA instead"
+                );
                 // The extra layers are empty.
                 mips.resize(mips.len() / used as usize * count as usize, 0);
-                mip_levels = levels;
-                device.create_texture_with_data(
+                log::info!(
+                    "Horizon: block sprite array {array}: {count} layers at {sprite_size}px, \
+                     {levels} mip levels, {} MiB, rss {} MiB",
+                    mips.len() / (1024 * 1024),
+                    rss_mib_for_log()
+                );
+                let texture = device.create_texture_with_data(
                     &queue,
                     &wgpu::TextureDescriptor {
                         label: Some("Block sprites"),
@@ -1956,17 +2117,116 @@ impl Renderer {
                     },
                     wgpu::util::TextureDataOrder::LayerMajor,
                     &mips,
-                )
+                );
+                log::info!(
+                    "Horizon: block sprite array {array} uploaded, rss {} MiB",
+                    rss_mib_for_log()
+                );
+                texture
             })
             .collect();
+        let mut layer_map = vec![u32::MAX; layers as usize];
+        for (dense, &layer) in animated_layers.iter().enumerate() {
+            layer_map[layer as usize] = dense as u32;
+        }
+        let animated_count = u32::try_from(animated_layers.len())?.max(1);
+        // The first frame comes from the pixels read above, so a sprite starts
+        // on its first frame rather than on nothing. One layer-major buffer:
+        // a layer's levels, then the next layer's.
+        let chain: usize = (0..sprite_levels)
+            .map(|level| {
+                let edge = (sprite_size >> level).max(1);
+                (edge * edge * 4) as usize
+            })
+            .sum();
+        let mut animated_data = vec![0u8; chain * animated_count as usize];
+        for (dense, pixels) in animated_pixels.iter().enumerate() {
+            if let Some(pixels) = pixels {
+                let start = dense * chain;
+                let len = pixels.len().min(chain);
+                animated_data[start..start + len].copy_from_slice(&pixels[..len]);
+            }
+        }
+        let animated_sprites = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("Animated block sprites"),
+                size: wgpu::Extent3d {
+                    width: sprite_size,
+                    height: sprite_size,
+                    depth_or_array_layers: animated_count,
+                },
+                mip_level_count: sprite_levels,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::STORAGE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &animated_data,
+        );
+        log::info!(
+            "Horizon: {animated_count} animated sprite layers in their own array, rss {} MiB",
+            rss_mib_for_log()
+        );
+        // A texel per layer, read with `textureLoad`: a texture binds on every
+        // GLES 3.1 driver, where a fragment shader's storage buffers may not.
+        let map_width = (layers.max(1)).next_multiple_of(64);
+        layer_map.resize(map_width as usize, u32::MAX);
+        let sprite_layers = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Block sprite layers"),
+            size: wgpu::Extent3d {
+                width: map_width,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &sprite_layers,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&layer_map),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(map_width * 4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: map_width,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let sprite_layers = sprite_layers.create_view(&Default::default());
+        let animated_view = animated_sprites.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         let animations = animate::SpriteAnimator::new(
             &device,
             animations,
             sprite_size,
             sprite_mips,
-            &sprite_textures,
-            split,
+            &animated_sprites,
+            &layer_map,
             animate::SpriteAnimator::compute(&adapter, &device),
+        );
+        log::info!(
+            "Horizon: sprite animator ready, rss {} MiB",
+            rss_mib_for_log()
         );
         let active_layer_words = animations.active_layer_words();
         let sprite_unused = device
@@ -2023,6 +2283,8 @@ impl Renderer {
             &lightmap_view,
             &lightmap_sampler,
             &emission_stats.view,
+            &animated_view,
+            &sprite_layers,
         );
         let crosshair_group = terrain_group(
             &device,
@@ -2034,6 +2296,8 @@ impl Renderer {
             &lightmap_view,
             &lightmap_sampler,
             &emission_stats.view,
+            &animated_view,
+            &sprite_layers,
         );
         let mirror_group = terrain_group(
             &device,
@@ -2045,6 +2309,8 @@ impl Renderer {
             &lightmap_view,
             &lightmap_sampler,
             &emission_stats.view,
+            &animated_view,
+            &sprite_layers,
         );
         let index_quads = 1 << 16;
         let indices = Self::quad_indices(&device, index_quads);
@@ -2070,6 +2336,10 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let (atlas_pixels, atlas_width, atlas_height) = hud_atlas;
+        log::info!(
+            "Horizon: shared atlas {atlas_width}x{atlas_height}, {} MiB",
+            u64::from(atlas_width) * u64::from(atlas_height) * 4 / (1024 * 1024)
+        );
         let limit = device.limits().max_texture_dimension_2d;
         if atlas_width.max(atlas_height) > limit {
             return Err(format!(
@@ -2077,28 +2347,164 @@ impl Renderer {
             )
             .into());
         }
-        let atlas = device.create_texture_with_data(
-            &queue,
-            &wgpu::TextureDescriptor {
-                label: Some("Shared atlas"),
-                size: wgpu::Extent3d {
-                    width: atlas_width,
-                    height: atlas_height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                // COPY_SRC: a shader pack's weather copies the rain and snow sprites out.
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            atlas_pixels,
-        );
+        // The loading screen hands the game the same atlas pixels: reusing the
+        // previous texture skips the upload and, where the GPU's memory counts
+        // against the process (a 1 GB handheld's Mali), a second copy of it.
+        let reused = previous
+            .and_then(|renderer| renderer.hud.atlas_texture.as_ref())
+            .filter(|texture| texture.width() == atlas_width && texture.height() == atlas_height);
+        // The baked ASTC copy of that spill, when `patch.bash` made one and
+        // this GPU samples it: a quarter of the bytes to read and to hold.
+        // Not the ASTC bake: the atlas takes run-time patches (font glyphs,
+        // skins, maps) as RGBA at arbitrary positions, and an ASTC texture can
+        // only be written in whole 4x4 blocks, which made the first patched
+        // frame fail with "Copy origin's x component is not a multiple of block
+        // width". Compressing it needs those mutable sprites in a texture of
+        // their own first; the bake stays beside the spill for that.
+        let baked: Option<wgpu::Texture> = None;
+        let atlas = match reused {
+            Some(texture) => {
+                log::info!(
+                    "Horizon: shared atlas {atlas_width}x{atlas_height} reused from the previous renderer"
+                );
+                texture.clone()
+            }
+            None if baked.is_some() => {
+                log::info!(
+                    "Horizon: shared atlas {atlas_width}x{atlas_height} loaded from its ASTC bake"
+                );
+                baked.expect("checked just above")
+            }
+            None if atlas_pixels.is_empty() => {
+                // The caller spilled the CPU atlas to the game folder and
+                // dropped it, because 80 MiB of pixels held beside a world's
+                // tables is what a 1 GB console's killer acts on. Stream it
+                // back a band at a time: the transient copy stays a few MiB.
+                let Some(path) = hud_atlas_file else {
+                    return Err(
+                        "the shared atlas has no CPU pixels left and no previous texture to reuse"
+                            .into(),
+                    );
+                };
+                use std::io::{Read as _, Seek as _, SeekFrom};
+                let atlas = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Shared atlas"),
+                    size: wgpu::Extent3d {
+                        width: atlas_width,
+                        height: atlas_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let started = std::time::Instant::now();
+                let bytes_per_row = atlas_width * 4;
+                let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
+                let mut buf = vec![0u8; (rows * bytes_per_row) as usize];
+                let mut file = std::fs::File::open(path).map_err(|e| {
+                    format!("the shared atlas at {}: {e}", path.display())
+                })?;
+                let mut y = 0;
+                while y < atlas_height {
+                    let height = rows.min(atlas_height - y);
+                    let len = (height * bytes_per_row) as usize;
+                    file.seek(SeekFrom::Start(u64::from(y) * u64::from(bytes_per_row)))
+                        .map_err(|e| e.to_string())?;
+                    file.read_exact(&mut buf[..len]).map_err(|e| e.to_string())?;
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &atlas,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &buf[..len],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: Some(height),
+                        },
+                        wgpu::Extent3d {
+                            width: atlas_width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    queue.submit([]);
+                    y += height;
+                }
+                log::info!(
+                    "Horizon: shared atlas {atlas_width}x{atlas_height} streamed from {} in {} ms",
+                    path.display(),
+                    started.elapsed().as_millis()
+                );
+                atlas
+            }
+            None => {
+                let atlas = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Shared atlas"),
+                    size: wgpu::Extent3d {
+                        width: atlas_width,
+                        height: atlas_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    // COPY_SRC: a shader pack's weather copies the rain and snow sprites out.
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                // `create_texture_with_data` stages the whole atlas (80 MiB on
+                // the default resources) in one buffer, which lands beside the
+                // packed CPU atlas at the peak of a 1 GB handheld. Upload in
+                // row chunks, flushing each staging buffer before the next, so
+                // the transient copy stays a few MiB.
+                let bytes_per_row = atlas_width * 4;
+                let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
+                let mut y = 0;
+                while y < atlas_height {
+                    let height = rows.min(atlas_height - y);
+                    let start = (y * bytes_per_row) as usize;
+                    let end = start + (height * bytes_per_row) as usize;
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &atlas,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &atlas_pixels[start..end],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: Some(height),
+                        },
+                        wgpu::Extent3d {
+                            width: atlas_width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    queue.submit([]);
+                    y += height;
+                }
+                log::info!(
+                    "Horizon: shared atlas {atlas_width}x{atlas_height} uploaded, rss {} MiB",
+                    rss_mib_for_log()
+                );
+                atlas
+            }
+        };
         let atlas_view = atlas.create_view(&Default::default());
         // vanilla's `GlintSampler`: enchanted_glint_item as its own texture,
         // repeated per pixel (`clamp: false`), linear without mipmaps
@@ -3170,6 +3576,9 @@ impl Renderer {
             lightmap,
             sprite_textures,
             sprite_unused,
+            animated_view,
+            sprite_layers,
+            sprite_astc,
             mip_levels,
             mipmaps: mip_levels - 1,
             terrain_layout: bindings,
@@ -4236,6 +4645,12 @@ impl Renderer {
 
     fn pack_terrain_inputs(&mut self) -> Option<horizon_shaders::GbuffersInputs> {
         if self.pack_atlas.is_none() {
+            if self.sprite_astc {
+                log::warn!(
+                    "Horizon: a shader pack needs RGBA block sprites; the ASTC bake is skipped"
+                );
+                return None;
+            }
             let mut encoder = self.device.create_command_encoder(&Default::default());
             let layers = self
                 .sprite_textures
@@ -4346,6 +4761,8 @@ impl Renderer {
             &self.lightmap_view,
             &self.lightmap_sampler,
             &self.emission_stats.view,
+            &self.animated_view,
+            &self.sprite_layers,
         );
     }
     /// The Mipmap Levels option: block textures sample at most `levels`

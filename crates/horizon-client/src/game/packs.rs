@@ -408,6 +408,7 @@ pub(super) fn stage_pack(
     atlas.font.japanese = japanese;
     let gui = UiResources {
         atlas,
+        atlas_file: None,
         panorama: Arc::new(panorama.unwrap_or_else(|p| std::panic::resume_unwind(p))),
     };
     progress.set(2);

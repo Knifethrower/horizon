@@ -362,10 +362,14 @@ impl Settings {
         };
         settings.describe_for_crashes();
         // Options.load: the backend asked for at startup, what a restart is measured from.
-        Self {
+        let settings = Self {
             startup_api: settings.horizon.api,
             ..settings
-        }
+        };
+        // Before any renderer builds a block sprite array: the option decides
+        // how many mip levels each array allocates (`sprites::mip_cap`).
+        crate::sprites::set_mip_cap(settings.mipmap_levels);
+        settings
     }
     /// The render settings and resource packs a crash report lists.
     fn describe_for_crashes(&self) {
@@ -417,7 +421,7 @@ impl Settings {
         for (i, source) in SOUND_SOURCES.iter().enumerate() {
             volumes[i] = f.double(&format!("soundCategory_{source}")) as f32;
         }
-        Self {
+        let settings = Self {
             fov: f.int("fov") as f32,
             render_distance: f.int("renderDistance"),
             simulation_distance: f.int("simulationDistance"),
@@ -496,7 +500,11 @@ impl Settings {
             resource_packs: f.list("resourcePacks"),
             keys,
             file: f,
-        }
+        };
+        // Before any renderer builds a block sprite array: the option decides
+        // how many mip levels each array allocates (`sprites::mip_cap`).
+        crate::sprites::set_mip_cap(settings.mipmap_levels);
+        settings
     }
     /// `Options.createInformation`: what the server learns about this player.
     pub fn client_information(&self, view_distance: i8) -> ClientInformation {

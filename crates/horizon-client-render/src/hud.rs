@@ -83,6 +83,10 @@ pub struct HudAtlas {
     /// A resource pack's own `core/text` shader for the GUI's text, translated;
     /// none draws the text natively.
     pub text_shader: Option<std::sync::Arc<horizon_shaders::CoreProgram>>,
+    /// The used width in texels of each `font/ascii_sga` glyph, measured while
+    /// the atlas is packed: the enchanting table's Galactic text spaces by it,
+    /// and the CPU copy of the atlas is freed once it is on the GPU.
+    pub galactic: [u8; 256],
     white: Rect,
 }
 /// Atlas rows reserved for glyphs rasterized at run time.
@@ -477,6 +481,7 @@ impl HudAtlas {
             sprite_animations: Vec::new(),
             glint: (vec![0; 4], 1, 1),
             glint_armor: (vec![0; 4], 1, 1),
+            galactic: [0; 256],
             white,
             text_shader: None,
         }
@@ -673,7 +678,7 @@ impl HudAtlas {
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut sprites = HashMap::new();
         let mut translucent = HashSet::new();
-        for ((name, w, h, data), (px, py)) in images.iter().zip(placements) {
+        for ((name, w, h, data), (px, py)) in images.drain(..).zip(placements) {
             if data
                 .as_chunks::<4>()
                 .0
@@ -682,14 +687,18 @@ impl HudAtlas {
             {
                 translucent.insert(name.clone());
             }
-            for row in 0..*h {
+            for row in 0..h {
                 let src = &data[(row * w * 4) as usize..((row + 1) * w * 4) as usize];
                 let dst = (((py + row) * width + px) * 4) as usize;
                 pixels[dst..dst + (w * 4) as usize].copy_from_slice(src);
             }
-            let b = u32::from(bordered.contains(name));
+            // The image is in the atlas now: let it go before the next one is
+            // decoded into place, so the whole decoded set and the atlas never
+            // both sit in memory (tens of MiB of a 1 GB handheld's load peak).
+            drop(data);
+            let b = u32::from(bordered.contains(&name));
             let (px, py, w, h) = (px + b, py + b, w - 2 * b, h - 2 * b);
-            let (gw, gh) = gui_sizes.get(name).copied().unwrap_or((w, h));
+            let (gw, gh) = gui_sizes.get(&name).copied().unwrap_or((w, h));
             sprites.insert(
                 name.clone(),
                 Rect {
@@ -701,6 +710,33 @@ impl HudAtlas {
                     h: gh,
                 },
             );
+        }
+        // The stitched atlas holds everything the images did; the decoded
+        // copies are 80 MiB of a handheld's RAM and nothing reads them again.
+        drop(images);
+        // Measure the Galactic alphabet's glyphs now: `stations.rs` spaces its
+        // text by them, and the CPU atlas is dropped after the GPU upload.
+        let mut galactic = [0u8; 256];
+        if let Some(sheet) = sprites.get("font/ascii_sga").copied() {
+            let cell = sheet.w / 16;
+            let (px, py) = (
+                (sheet.u0 * width as f32) as u32,
+                (sheet.v0 * height as f32) as u32,
+            );
+            for code in (0x41u32..=0x5A).chain(0x61..=0x7A) {
+                let (col, row) = (code % 16, code / 16);
+                let (cx, cy) = (px + col * cell, py + row * cell);
+                let mut used = 0;
+                for dx in (0..cell).rev() {
+                    if (0..cell).any(|dy| {
+                        pixels[(((cy + dy) * width + cx + dx) * 4 + 3) as usize] != 0
+                    }) {
+                        used = dx + 1;
+                        break;
+                    }
+                }
+                galactic[code as usize] = used as u8;
+            }
         }
         // Every animated sprite animates: the packed strip is the raw first
         // frame, while the mcmeta's frame list may start anywhere, so each
@@ -760,6 +796,7 @@ impl HudAtlas {
             glint,
             glint_armor,
             text_shader: None,
+            galactic,
             font,
             white,
         })

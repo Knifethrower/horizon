@@ -463,6 +463,12 @@ struct Options {
     session_file: Option<String>,
     /// `--session-stdin`: the session file's JSON comes on standard input instead.
     session_stdin: bool,
+    /// `--bake-atlas`: pack the GUI atlas and write its ASTC cache, then quit.
+    /// `patch.bash` runs this once per install; it needs no window and no GPU.
+    bake_atlas: bool,
+    /// `--astcenc PATH`: the encoder `--bake-atlas` runs (default: `tools/astcenc`
+    /// beside the executable, or `$HORIZON_ASTCENC`).
+    astcenc: Option<PathBuf>,
 }
 /// `--in-frame`, `--no-server-thread` and `HORIZON_SERVER_THREAD=0` are deprecated:
 /// the in-frame world is unmaintained, gets no fixes and will be removed soon.
@@ -600,12 +606,14 @@ impl Options {
             quick_play: None,
             session_file: std::env::var("HORIZON_SESSION_FILE").ok(),
             session_stdin: false,
+            bake_atlas: false,
+            astcenc: None,
         };
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --in-frame              DEPRECATED, do not use: unsupported, will be removed soon (also --no-server-thread)\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
+                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --bake-atlas            Pack the GUI atlas and write its ASTC cache, then quit (patch.bash)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --in-frame              DEPRECATED, do not use: unsupported, will be removed soon (also --no-server-thread)\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
                         horizon_core::VANILLA_VERSION
                     );
                     return Ok(None);
@@ -630,6 +638,7 @@ impl Options {
                     o.offscreen = true;
                 }
                 "--control" => o.control = Some(horizon_client::control::default_path()),
+                "--bake-atlas" => o.bake_atlas = true,
                 "--server-thread" => o.server_thread = true,
                 "--in-frame" | "--no-server-thread" => {
                     warn_in_frame_deprecated(&arg);
@@ -705,6 +714,7 @@ impl Options {
                             "--name" => o.player_name = Some(value),
                             "--session-file" => o.session_file = Some(value),
                             "--control-socket" => o.control = Some(value.into()),
+                            "--astcenc" => o.astcenc = Some(value.into()),
                             "--time" => o.time = Some(value.parse()?),
                             "--weather" => o.weather = Some(value),
                             "--dimension" => {
@@ -1847,6 +1857,10 @@ pub(super) fn armor_slot(index: usize) -> horizon_world::player_inventory::Equip
 pub struct UiResources {
     /// The GUI, font, particle, map and skin atlas.
     pub atlas: HudAtlas,
+    /// Where the atlas's CPU pixels were spilled when they were too large to
+    /// hold next to a world's tables; the renderer streams the texture back
+    /// from it. `None` while `HudAtlas::pixels` still holds them.
+    pub atlas_file: Option<PathBuf>,
     /// The title screen's panorama faces.
     pub panorama: Arc<horizon_client::gfx::panorama::Faces>,
 }
@@ -1856,6 +1870,7 @@ impl UiResources {
     pub fn load(root: &std::path::Path, defaults: &std::path::Path) -> Result<Self> {
         Ok(Self {
             atlas: HudAtlas::build_over(root, defaults)?,
+            atlas_file: None,
             panorama: Arc::new(horizon_client::gfx::panorama::Faces::load(root)),
         })
     }
@@ -1864,6 +1879,7 @@ impl UiResources {
     pub fn server(root: &std::path::Path) -> Result<Self> {
         Ok(Self {
             atlas: HudAtlas::fonts(root)?,
+            atlas_file: None,
             panorama: Arc::new(horizon_client::gfx::panorama::Faces {
                 size: 1,
                 pixels: [0u8; 4].repeat(6),
@@ -16831,6 +16847,30 @@ impl Game<'_> {
                         }
                         self.frames += 1;
                         self.fps_frames += 1;
+                        // One profile line in the ordinary log every 250 world
+                        // frames (about ten seconds at the frame rates a
+                        // handheld reaches), so a session can be read back
+                        // afterwards with no control socket and no overlay:
+                        // frame time percentiles, CPU time, and which phase
+                        // the frame spent it in. Silent off the world.
+                        if self.world_frames % 250 == 249 {
+                            let summary = self.frame_stats.summary();
+                            let number = |v: &serde_json::Value| v.as_f64().unwrap_or(f64::NAN);
+                            let phases = &summary["phases_avg_ms"];
+                            log::info!(
+                                "Horizon: profile {:.1} fps, frame p50 {:.1} p95 {:.1} max {:.1} ms, cpu {:.1} ms, phases update {:.1} tick {:.1} prepare {:.1} render {:.1}",
+                                number(&summary["avg_fps"]),
+                                number(&summary["p50_ms"]),
+                                number(&summary["p95_ms"]),
+                                number(&summary["max_ms"]),
+                                number(&summary["cpu"]["avg_ms"]),
+                                number(&phases["update"]),
+                                number(&phases["tick"]),
+                                number(&phases["prepare"]),
+                                number(&phases["render"]),
+                            );
+                            self.frame_stats.reset();
+                        }
                         horizon_client::crash::debug_crash_tick();
                         if self.fps_at.elapsed() >= Duration::from_secs(1) {
                             self.fps = self.fps_frames as f32 / self.fps_at.elapsed().as_secs_f32();
@@ -17993,6 +18033,7 @@ struct GameplayTables {
 fn load_core(
     root: &std::path::Path,
     headless: bool,
+    sprites: bool,
     parallel: bool,
     progress: &Progress,
 ) -> std::result::Result<std::result::Result<CoreTables, String>, String> {
@@ -18007,8 +18048,9 @@ fn load_core(
             let assets = &assets;
             let render = Step::spawn(scope, parallel, move || {
                 // A server reads no block sprites' pixels, which only the
-                // renderer draws (32 MB).
-                let render = if headless {
+                // renderer draws (32 MB). The bake runs without a window, but
+                // it packs the renderer's own arrays, so it asks for them.
+                let render = if headless && !sprites {
                     assets.reload_for_server(root)
                 } else {
                     assets.reload(root)
@@ -18048,6 +18090,7 @@ fn load_core(
                 collision.join(),
             )
         });
+    horizon_threads::release_free_memory();
     // The packs' failure first: it rolls back whatever else failed.
     let (render, item_renderer) = match render {
         Ok(render) => render,
@@ -18096,6 +18139,7 @@ fn gameplay_tables(
             MotionResources::load_with_facts(root, assets, &facts).map_err(|e| e.to_string());
         (light.join(), motion)
     });
+    horizon_threads::release_free_memory();
     Ok(GameplayTables {
         light: light?,
         motion: motion?,
@@ -18117,6 +18161,7 @@ fn load_resources(
     started: Instant,
     menu: bool,
     headless: bool,
+    sprites: bool,
     progress: &Progress,
     publish: &mut dyn FnMut(UiResources, &std::path::Path),
 ) -> Result<Loaded> {
@@ -18155,7 +18200,7 @@ fn load_resources(
     let (core, loaded_gui) = loop {
         let (ui, core) = std::thread::scope(|scope| {
             let core = Step::spawn(scope, parallel, || {
-                load_core(&root, headless, parallel, progress)
+                load_core(&root, headless, sprites, parallel, progress)
             });
             let ui = load_ui(&root).map(|ui| offer(ui, &root));
             (ui, core.join())
@@ -18180,7 +18225,11 @@ fn load_resources(
         pack_error = Some(failure);
         root = vanilla_root.to_path_buf();
     };
-    log::info!("load core tables: {:.2}s", started.elapsed().as_secs_f32());
+    log::info!(
+        "load core tables: {:.2}s, rss {} MiB",
+        started.elapsed().as_secs_f32(),
+        rss_mib()
+    );
     let CoreTables {
         assets,
         render,
@@ -18214,7 +18263,11 @@ fn load_resources(
         biomes.clone(),
         Arc::new(light),
     );
-    log::info!("load pack tables: {:.2}s", started.elapsed().as_secs_f32());
+    log::info!(
+        "load pack tables: {:.2}s, rss {} MiB",
+        started.elapsed().as_secs_f32(),
+        rss_mib()
+    );
     progress.set(4);
     if !menu {
         horizon_client::ui::load_metadata(&root);
@@ -18250,8 +18303,9 @@ fn load_resources(
     let renderer_cpu = menu.then(|| prepare_renderer_textures(&pack));
     if menu {
         log::info!(
-            "Horizon: handoff CPU resources prepared on worker in {} ms",
-            prepared_at.elapsed().as_millis()
+            "Horizon: handoff CPU resources prepared on worker in {} ms, rss {} MiB",
+            prepared_at.elapsed().as_millis(),
+            rss_mib()
         );
     }
     // The block entity renderer's face visibility: the meshes' own, whose
@@ -18284,8 +18338,9 @@ fn load_resources(
                 progress.set(9);
                 horizon_client::telemetry::mark_rest_ready();
                 log::info!(
-                    "Horizon: rest-ready after {} ms",
-                    started.elapsed().as_millis()
+                    "Horizon: rest-ready after {} ms, rss {} MiB",
+                    started.elapsed().as_millis(),
+                    rss_mib()
                 );
                 Ok(())
             })?;
@@ -18342,19 +18397,49 @@ fn load_world_rest(
     let registry = assets.registry;
     let overlay = &horizon_world::loot::PackOverlay::NONE;
     progress.set(6);
+    log::info!("Horizon: rest load started, rss {} MiB", rss_mib());
+    let watch = RestWatch::start();
+    watch.at(0);
     // Independent tables load together, within the worker budget the settings
     // allow. Only the recipes and the stations read another table: the items.
     let load_items = || -> Result<_> {
+        watch.at(1);
         let items = Items::load(root, registry, facts, overlay)?;
-        log::info!("load items: {:.2}s", started.elapsed().as_secs_f32());
+        // The item models' JSON trees are gone; the tail runs beside the
+        // renderer's upload, so the pages must not join that peak.
+        horizon_threads::release_free_memory();
+        log::info!(
+            "load items: {:.2}s, rss {} MiB, peak {} MiB",
+            started.elapsed().as_secs_f32(),
+            rss_mib(),
+            peak_mib()
+        );
         progress.set(7);
+        watch.at(2);
         let recipes = Recipes::load(root, &items, overlay)?;
+        horizon_threads::release_free_memory();
+        log::info!(
+            "load recipes: {:.2}s, rss {} MiB, peak {} MiB",
+            started.elapsed().as_secs_f32(),
+            rss_mib(),
+            peak_mib()
+        );
+        watch.at(3);
         let stations = horizon_client::stations::StationData::load(root, &items, overlay);
+        log::info!(
+            "load stations: {:.2}s, rss {} MiB, peak {} MiB",
+            started.elapsed().as_secs_f32(),
+            rss_mib(),
+            peak_mib()
+        );
         Ok((items, recipes, stations))
     };
-    let load_behaviours =
-        || Behaviours::load_with_gameplay(registry, root, behaviour_json, gameplay_projection);
+    let load_behaviours = || {
+        watch.at(4);
+        Behaviours::load_with_gameplay(registry, root, behaviour_json, gameplay_projection)
+    };
     let load_block_entity_render = || {
+        watch.at(5);
         if !draws {
             return Ok(Default::default());
         }
@@ -18363,6 +18448,7 @@ fn load_world_rest(
         )
     };
     let load_animate = || -> Result<_> {
+        watch.at(6);
         let animate = if draws {
             horizon_client::animate_tick::AnimateTables::load(root, registry, biomes)?
         } else {
@@ -18371,6 +18457,7 @@ fn load_world_rest(
         Ok((animate, horizon_client::fog::FogTables::load(root, biomes)))
     };
     let load_mobs = || -> Result<_> {
+        watch.at(7);
         let mob_types: HashMap<_, _> = MobTypes::load(root)?
             .types
             .into_iter()
@@ -18381,6 +18468,7 @@ fn load_world_rest(
         Ok((mob_types, mob_data))
     };
     let load_transformers = || -> Result<_> {
+        watch.at(8);
         let transformers = horizon_client::block_transform::Transformers::load(root, registry)?;
         let models = (
             perspective::player_type(root),
@@ -18423,17 +18511,28 @@ fn load_world_rest(
             text(load_transformers()),
         )
     };
+    // The six loads' scratch pages are free now, but the allocator keeps them
+    // mapped: hand them back before the world allocates its own.
+    watch.at(9);
+    horizon_threads::release_free_memory();
+    log::info!(
+        "Horizon: rest tables loaded, rss {} MiB, peak {} MiB",
+        rss_mib(),
+        peak_mib()
+    );
+    drop(watch);
     let (items, recipes, stations) = items?;
     let (animate, fog) = animate?;
     let (mob_types, mob_data) = mobs?;
     let (transformers, (player_type, player_arm, player_arm_slim, spin_attack)) = transformers?;
     log::info!(
-        "Horizon: resources loaded in {:.1}s; {} block states, {} items, {} biomes; {} worker threads",
+        "Horizon: resources loaded in {:.1}s; {} block states, {} items, {} biomes; {} worker threads, rss {} MiB",
         started.elapsed().as_secs_f32(),
         facts.states.len(),
         items.items.len(),
         biomes.list.len(),
-        threads
+        threads,
+        rss_mib()
     );
     progress.set(8);
     Ok(WorldRest {
@@ -18460,6 +18559,77 @@ fn load_world_rest(
 }
 
 /// CPU mip chains for the block sprites and world border.
+/// This process's resident set size, for the low-memory instrumentation.
+fn rss_mib() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        .map(|pages| pages * 4 / 1024)
+        .unwrap_or(0)
+}
+
+/// The process's high-water mark, to tell a peak from the memory still held.
+fn peak_mib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(0)
+}
+
+/// Logs the RSS and peak every 250 ms while a world's tables load, with the
+/// stage the loader last entered, to find which one a console runs out in.
+struct RestWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stage: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl RestWatch {
+    const STAGES: [&'static str; 11] = [
+        "start",
+        "items",
+        "recipes",
+        "stations",
+        "behaviours",
+        "block-entity",
+        "animate",
+        "mobs",
+        "transformers",
+        "joined",
+        "waiting",
+    ];
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stage = std::sync::Arc::new(AtomicUsize::new(0));
+        let (stop2, stage2) = (stop.clone(), stage.clone());
+        std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                let at = stage2.load(Ordering::Relaxed);
+                log::info!(
+                    "rest watch: {} rss {} MiB, peak {} MiB",
+                    Self::STAGES.get(at).copied().unwrap_or("?"),
+                    rss_mib(),
+                    peak_mib()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
+        Self { stop, stage }
+    }
+    fn at(&self, stage: usize) {
+        self.stage.store(stage, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl Drop for RestWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn prepare_renderer_textures(pack: &PackResources) -> horizon_client::gfx::PreparedTextures {
     let assets = &pack.render;
     horizon_client::gfx::PreparedTextures::new(
@@ -18491,6 +18661,13 @@ fn build_renderer(
     // Chinese and Japanese menu labels go blank when the loading screen hands
     // over to the game.
     atlas.font.reset_cache();
+    // Low memory: the pack's and the atlas's CPU temporaries are dead by now,
+    // but mimalloc holds freed pages. Give them back before a second renderer
+    // (its pipelines, and the world's 80 MiB atlas) is built beside the
+    // loading screen's on a device where both count against the process.
+    horizon_threads::release_free_memory();
+    log::info!("Horizon: building the renderer, rss {} MiB", rss_mib());
+    let build_started = std::time::Instant::now();
     let mut renderer = pollster::block_on(Renderer::new(
         window,
         offscreen,
@@ -18501,6 +18678,7 @@ fn build_renderer(
         &assets.sprite_mips,
         &assets.animations,
         (&atlas.pixels, atlas.width, atlas.height),
+        gui.atlas_file.as_deref(),
         (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
         (
             &atlas.glint_armor.0,
@@ -18513,6 +18691,12 @@ fn build_renderer(
         previous,
         api,
     ))?;
+    horizon_threads::release_free_memory();
+    log::info!(
+        "Horizon: renderer built in {} ms, rss {} MiB",
+        build_started.elapsed().as_millis(),
+        rss_mib()
+    );
     renderer.hud.sprite_animations = atlas
         .sprite_animations
         .iter()
@@ -18531,6 +18715,7 @@ fn loading_renderer(
     window: Arc<Window>,
     offscreen: bool,
     atlas: Option<&horizon_client::hud::HudAtlas>,
+    atlas_file: Option<&std::path::Path>,
     panorama: Option<&horizon_client::gfx::panorama::Faces>,
     previous: Option<&Renderer>,
     api: horizon_client::graphics::GraphicsApi,
@@ -18566,6 +18751,7 @@ fn loading_renderer(
         &[],
         &[],
         (pixels, width, height),
+        atlas_file,
         (glint_pixels, glint_width, glint_height),
         (glint_pixels, glint_width, glint_height),
         (&FORCEFIELD[..], 1),
@@ -18966,6 +19152,7 @@ impl Loading {
             Some(&self.boot),
             None,
             None,
+            None,
             self.settings.horizon.api,
         ) {
             Ok(r) => self.renderer = Some(r),
@@ -19012,6 +19199,50 @@ impl Loading {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // A world or a server to open at start (quick play, --world, --server)
+        // means the menu is never shown: the loading screen keeps the small
+        // boot atlas and the pack's atlas goes to the GPU when the world
+        // renderer is built. Uploading it here would hold its texture through
+        // the world's table loads, which is where a 1 GB console runs out.
+        let auto = self
+            .options
+            .as_ref()
+            .is_some_and(|o| o.world.is_some() || o.server.is_some());
+        // Nothing reads the packed pixels after the upload, so spill them to
+        // the game folder and drop the copy (80 MiB on the default resources)
+        // instead of carrying it beside the world's tables. The renderer
+        // streams the texture back from the file (`UiResources::atlas_file`).
+        if let Some(gui) = self.gui.as_mut()
+            && gui.atlas.pixels.len() > 8 << 20
+            && let Ok(dir) = std::env::current_dir()
+        {
+            let path = dir.join("cache").join(format!(
+                "hud-atlas-{}x{}.rgba",
+                gui.atlas.width, gui.atlas.height
+            ));
+            let written = path
+                .parent()
+                .is_none_or(|parent| std::fs::create_dir_all(parent).is_ok())
+                && std::fs::write(&path, &gui.atlas.pixels).is_ok();
+            if written {
+                gui.atlas_file = Some(path.clone());
+                gui.atlas.pixels = Vec::new();
+                gui.atlas.pixels.shrink_to_fit();
+                horizon_threads::release_free_memory();
+                log::info!(
+                    "Horizon: shared atlas spilled to {} and its CPU copy dropped, rss {} MiB",
+                    path.display(),
+                    rss_mib()
+                );
+            }
+        }
+        if auto {
+            log::info!(
+                "Horizon: quick play, the loading screen keeps the boot atlas, rss {} MiB",
+                rss_mib()
+            );
+            return;
+        }
         let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
@@ -19021,6 +19252,7 @@ impl Loading {
             window,
             offscreen,
             Some(&bundle.atlas),
+            bundle.atlas_file.as_deref(),
             Some(bundle.panorama.as_ref()),
             self.renderer.as_ref(),
             self.settings.horizon.api,
@@ -19028,6 +19260,10 @@ impl Loading {
             Ok(r) => {
                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
                 self.renderer = Some(r);
+                log::info!(
+                    "Horizon: loading screen shows the pack atlas, rss {} MiB",
+                    rss_mib()
+                );
             }
             Err(e) => self.error = Some(e),
         }
@@ -19098,12 +19334,16 @@ impl Loading {
         // StartupMenu owns world selection until it can hand it to Game.
         options.world = None;
         options.server = None;
-        let gui = self.gui.take().ok_or("missing menu bundle")?;
+        let mut gui = self.gui.take().ok_or("missing menu bundle")?;
         let window = self.window.clone().ok_or("window closed")?;
         // Keep the loader's device and swap in the real textures in one step.
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
         }
+        // The core tables, the item models and the handoff left their parse
+        // buffers behind; give those pages back before the renderer's own
+        // peak (the sprite uploads and the title panorama) lands on them.
+        horizon_threads::release_free_memory();
         let renderer_at = Instant::now();
         let renderer = build_renderer(
             window.clone(),
@@ -19118,6 +19358,13 @@ impl Loading {
             "Horizon: world renderer ready after {} ms",
             self.started.elapsed().as_millis()
         );
+        // The panorama's CPU faces and the prepared mip chains are gone now.
+        horizon_threads::release_free_memory();
+        // The atlas lives in the renderer's texture now. Its CPU copy is the
+        // largest single allocation left (80 MiB on the default resources),
+        // and every later renderer reuses that texture (same dimensions).
+        gui.atlas.pixels = Vec::new();
+        gui.atlas.pixels.shrink_to_fit();
         let renderer_ms = renderer_at.elapsed().as_millis();
         // Audio is created on the main thread, after the core is ready.
         let audio = if !options.execution_role.is_client() {
@@ -19322,10 +19569,133 @@ fn run_loading(
 
 pub use launch_api::{UsageError, exit_code};
 
+/// `--bake-atlas`: pack the GUI atlas exactly as a world start does, then write
+/// its ASTC cache with the encoder the port ships. `patch.bash` runs it once
+/// per install, on the CPU: no window, no GPU, no world, no event loop.
+fn bake_atlas(options: &Options, vanilla_root: &std::path::Path) -> Result<()> {
+    let started = Instant::now();
+    let settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
+    let root = packs::startup_root(vanilla_root, &settings.resource_packs, &[]).unwrap_or_else(
+        |e| {
+            log::warn!("Horizon: resource packs not applied: {e}");
+            vanilla_root.to_path_buf()
+        },
+    );
+    let root = mods::content_root(&root, &settings.mods.enabled, &options.dev_mods);
+    let encoder = options
+        .astcenc
+        .clone()
+        .or_else(horizon_client::astc::find_encoder)
+        .ok_or("--bake-atlas has no encoder: pass --astcenc PATH or ship tools/astcenc")?;
+    let atlas = horizon_client::hud::HudAtlas::build_over(&root, vanilla_root)
+        .map_err(|e| e.to_string())?;
+    log::info!(
+        "Horizon: baked atlas source {}x{} from {} ({} MiB), packed in {:.1} s",
+        atlas.width,
+        atlas.height,
+        root.display(),
+        u64::from(atlas.width) * u64::from(atlas.height) * 4 / (1024 * 1024),
+        started.elapsed().as_secs_f32()
+    );
+    let dir = std::env::current_dir()?.join("cache");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("hud-atlas-{}x{}.astc", atlas.width, atlas.height));
+    let started = Instant::now();
+    horizon_client::astc::encode(&encoder, &atlas.pixels, atlas.width, atlas.height, &path)
+        .map_err(|e| e.to_string())?;
+    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+    log::info!(
+        "Horizon: baked {} ({} MiB, {:.1} bpp) with {} in {:.1} s",
+        path.display(),
+        bytes / (1024 * 1024),
+        (bytes * 8) as f64 / (f64::from(atlas.width) * f64::from(atlas.height)),
+        encoder.display(),
+        started.elapsed().as_secs_f32()
+    );
+    println!("{}", path.display());
+    // The block sprite arrays, packed exactly as the renderer packs them at
+    // startup, so the renderer finds a bake that matches its bytes.
+    match bake_sprites(root, vanilla_root, &settings, &encoder, &dir) {
+        Ok(()) => {}
+        Err(error) => log::warn!("Horizon: block sprite arrays not baked: {error}"),
+    }
+    Ok(())
+}
+
+/// Bake the block sprite arrays' ASTC caches. Needs the pack the renderer
+/// packs its sprites from, so it loads the core tables (without a window, a
+/// world or the UI atlas) and prepares the same textures the renderer would.
+fn bake_sprites(
+    root: PathBuf,
+    vanilla_root: &std::path::Path,
+    settings: &Settings,
+    encoder: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<()> {
+    let started = Instant::now();
+    let progress = Progress::new();
+    let mut publish = |_: UiResources, _: &std::path::Path| {};
+    let loaded = load_resources(
+        root,
+        None,
+        vanilla_root,
+        settings,
+        started,
+        false,
+        true,
+        true,
+        &progress,
+        &mut publish,
+    )?;
+    // A pack read for a server holds no pixels: a bake of it would be a
+    // transparent array the renderer's key never matches.
+    if loaded.pack.render.pixels.is_empty() {
+        return Err("no block sprite pixels in this pack".into());
+    }
+    // The bake outlives the Mipmap Levels option that shaped this run, so it
+    // is built with the whole chain the format can hold (down to one block)
+    // rather than with the option's count. The loader reads the prefix the
+    // option asks for, so one bake serves every value of it.
+    let bake_size = loaded.pack.render.sprite_size;
+    horizon_client::sprites::set_mip_levels(horizon_client::astc::max_levels(bake_size));
+    let prepared = prepare_renderer_textures(&loaded.pack);
+    let mut total = 0;
+    for (_array, size, layers, levels, bytes) in prepared.arrays() {
+        let key = horizon_client::astc::pack_key(size, std::iter::once((bytes, levels)));
+        let path = horizon_client::astc::array_path(dir, size, layers, levels, key);
+        let started = Instant::now();
+        horizon_client::astc::encode_array(encoder, bytes, size, layers, levels, &path)
+            .map_err(|e| e.to_string())?;
+        let written = std::fs::metadata(&path).map_or(0, |m| m.len());
+        total += written;
+        log::info!(
+            "Horizon: baked {} ({} layers at {size}px, {levels} mip levels, {} KiB) in {:.1} s",
+            path.display(),
+            layers,
+            written / 1024,
+            started.elapsed().as_secs_f32()
+        );
+        println!("{}", path.display());
+    }
+    log::info!(
+        "Horizon: baked the block sprite arrays ({} MiB) from {}",
+        total / (1024 * 1024),
+        loaded.root.display()
+    );
+    Ok(())
+}
 pub fn run() -> Result<()> {
     let Some(mut options) = Options::read()? else {
         return Ok(());
     };
+    if options.bake_atlas {
+        // Before anything opens a window, a world or a device.
+        let vanilla_root = options.resources.clone();
+        if let Some(error) = missing_resources(&vanilla_root) {
+            return Err(error.into());
+        }
+        return bake_atlas(&options, &vanilla_root);
+    }
     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
         && !dedicated::preflight(&mut options)?
     {
@@ -19412,6 +19782,7 @@ pub fn run() -> Result<()> {
         started,
         false,
         options.dedicated.is_some(),
+        false,
         &Progress::new(),
         &mut |_, _| {},
     )?;

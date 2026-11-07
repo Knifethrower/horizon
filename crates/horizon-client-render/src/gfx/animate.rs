@@ -77,18 +77,21 @@ pub(super) struct SpriteAnimator {
 }
 
 impl SpriteAnimator {
-    /// `textures` are the sprite arrays, `split` layers each, `size` pixels
-    /// wide; `animations` hold their frames at that size. `compute`: whether
-    /// the device says it runs compute shaders writing storage textures.
+    /// `texture` holds the animated sprites' layers, `size` pixels wide, and
+    /// `layer_index` maps a block sprite's layer to its layer there (or
+    /// `u32::MAX` when it does not animate); `animations` hold their frames at
+    /// that size. `compute`: whether the device says it runs compute shaders
+    /// writing storage textures.
     pub fn new(
         device: &wgpu::Device,
         animations: &[SpriteAnimation],
         size: u32,
         settings: &[Settings],
-        textures: &[wgpu::Texture],
-        split: u32,
+        texture: &wgpu::Texture,
+        layer_index: &[u32],
         compute: bool,
     ) -> Self {
+        let textures = std::slice::from_ref(texture);
         let pipeline = if compute { pipeline(device) } else { None };
         let limits = device.limits();
         let limit = if pipeline.is_some() {
@@ -105,6 +108,9 @@ impl SpriteAnimator {
         let mut counts: Vec<usize> = Vec::new();
         let mut sprites = Vec::with_capacity(animations.len());
         for animation in animations {
+            let Some(&dense) = layer_index.get(animation.layer as usize) else {
+                continue;
+            };
             let pixels: Vec<_> = (0..animation.frame_count())
                 .map(|frame| animation.pixels(frame))
                 .collect();
@@ -133,7 +139,7 @@ impl SpriteAnimator {
                     offset
                 })
                 .collect();
-            let key = (animation.layer / split, buffer);
+            let key = (0, buffer);
             let group = keys.iter().position(|&k| k == key).unwrap_or_else(|| {
                 keys.push(key);
                 counts.push(0);
@@ -143,7 +149,7 @@ impl SpriteAnimator {
             sprites.push(Sprite {
                 animation: animation.clone(),
                 shown: None,
-                layer: animation.layer % split,
+                layer: dense,
                 frames: offsets,
                 edge,
                 group,
@@ -495,9 +501,14 @@ fn source_chains(
         sheet.pixels.extend_from_slice(frame.as_chunks::<4>().0);
     }
     let has_transparent = s.has_transparent || sheet.pixels.iter().any(|p| p[3] == 0);
+    // The array's chains are as long as the option builds them (see
+    // `sprites::mip_cap`): a Mali pads every level of every layer.
+    let reduced = edge
+        .trailing_zeros()
+        .min(crate::sprites::mip_cap().saturating_sub(1));
     let levels = crate::mipmap::generate(
         sheet,
-        edge.trailing_zeros(),
+        reduced,
         Settings {
             has_transparent,
             ..s

@@ -52,12 +52,21 @@ struct Globals {
 // pixels must reach to shine in HDR output: r where the bright parts shine, g
 // where all of it does (gfx/hdr_stats.rs, measured from the sprite itself).
 @group(0) @binding(12) var emission_thresholds: texture_2d<f32>;
+// Per block sprite, the layer its frames live at in `animated` (an array of
+// its own, because a compressed texture cannot be rewritten), or `0xFFFFFFFF`
+// when it does not animate and stays in the arrays above.
+@group(0) @binding(13) var layer_map: texture_2d<u32>;
+@group(0) @binding(14) var animated: texture_2d_array<f32>;
 // How many sprite arrays hold layers (a pipeline constant): 1 for vanilla,
 // which then samples exactly as before.
 override SPRITE_ARRAYS: u32 = 1u;
 override SPRITE_SPLIT: u32 = 2048u;
 // A sprite sampled with the given gradients, from whichever array holds its layer.
 fn sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
+    let animated_layer = textureLoad(layer_map, vec2<i32>(i32(layer), 0), 0).r;
+    if (animated_layer != 0xFFFFFFFFu) {
+        return textureSampleGrad(animated, sprite_sampler, uv, i32(animated_layer), dx, dy);
+    }
     let l = i32(layer % SPRITE_SPLIT);
     if SPRITE_ARRAYS == 1u {
         return textureSampleGrad(sprites, sprite_sampler, uv, l, dx, dy);
@@ -75,6 +84,10 @@ fn sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<
 }
 // The same at an explicit mip level.
 fn sprite_level(uv: vec2<f32>, layer: u32, lod: f32) -> vec4<f32> {
+    let animated_layer = textureLoad(layer_map, vec2<i32>(i32(layer), 0), 0).r;
+    if (animated_layer != 0xFFFFFFFFu) {
+        return textureSampleLevel(animated, sprite_sampler, uv, i32(animated_layer), lod);
+    }
     let l = i32(layer % SPRITE_SPLIT);
     if SPRITE_ARRAYS == 1u {
         return textureSampleLevel(sprites, sprite_sampler, uv, l, lod);

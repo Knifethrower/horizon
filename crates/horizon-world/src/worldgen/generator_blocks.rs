@@ -128,6 +128,7 @@ impl BlockBehavior {
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
             Ok::<_, GeneratorError>((collisions, properties, Arc::new(support)))
         })?;
+        horizon_threads::release_free_memory();
         let collision = Arc::new(BlockCollisionRegistry::new(Arc::new(collisions))?);
         let rules = json("survival-rules.json")?
             .as_object()

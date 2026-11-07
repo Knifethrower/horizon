@@ -13,6 +13,43 @@ pub struct Faces {
     pub pixels: Vec<u8>,
 }
 
+/// A cube face of the title backdrop, at most this many texels a side.
+///
+/// The panorama is drawn behind the menu at the window's size, so a
+/// 1024x1024 face holds detail no screen shows, at 24 MiB of CPU pixels and
+/// as much again on the GPU. A quarter of the side keeps it soft but
+/// recognisable and costs 1.5 MiB.
+const FACE_MAX: u32 = 256;
+
+/// `data` box-filtered down to [`FACE_MAX`] a side, if it is larger.
+fn shrink(w: u32, data: Vec<u8>) -> (u32, Vec<u8>) {
+    let factor = w / FACE_MAX;
+    if factor <= 1 {
+        return (w, data);
+    }
+    let side = w / factor;
+    let count = (factor * factor) as u32;
+    let mut out = vec![0u8; (side * side * 4) as usize];
+    for y in 0..side {
+        for x in 0..side {
+            let mut acc = [0u32; 4];
+            for dy in 0..factor {
+                for dx in 0..factor {
+                    let i = (((y * factor + dy) * w + (x * factor + dx)) * 4) as usize;
+                    for (c, sum) in acc.iter_mut().enumerate() {
+                        *sum += data[i + c] as u32;
+                    }
+                }
+            }
+            let o = ((y * side + x) * 4) as usize;
+            for (c, sum) in acc.iter().enumerate() {
+                out[o + c] = (sum / count) as u8;
+            }
+        }
+    }
+    (side, out)
+}
+
 impl Faces {
     pub fn load(root: &Path) -> Self {
         Self::try_load(root).unwrap_or_else(|error| {
@@ -27,17 +64,21 @@ impl Faces {
     fn try_load(root: &Path) -> Result<Self> {
         let background = root.join("assets/minecraft/textures/gui/title/background");
         let mut size = 0;
+        // The faces' own size, before `shrink`: every face must match it.
+        let mut source = 0;
         let mut pixels = Vec::new();
         for face in FACE_ORDER {
             let path = background.join(format!("panorama_{face}.png"));
             let (w, h, data) = decode(&path)?;
-            if w != h || (size != 0 && w != size) {
+            if w != h || (source != 0 && w != source) {
                 return Err(format!(
                     "{}: panorama faces must be equally sized squares",
                     path.display()
                 )
                 .into());
             }
+            source = w;
+            let (w, data) = shrink(w, data);
             size = w;
             // CubeMapTexture copies each original image with flipY=true. Keep every texel.
             for row in data.chunks_exact((w * 4) as usize).rev() {
@@ -73,6 +114,12 @@ impl Panorama {
         format: wgpu::TextureFormat,
         faces: &Faces,
     ) -> Self {
+        log::info!(
+            "Horizon: title panorama {}x{}x6, {} MiB",
+            faces.size,
+            faces.size,
+            u64::from(faces.size) * u64::from(faces.size) * 6 * 4 / (1024 * 1024)
+        );
         let texture = device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {

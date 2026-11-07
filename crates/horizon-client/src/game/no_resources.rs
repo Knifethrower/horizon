@@ -24,6 +24,7 @@ pub(super) fn show(looked_in: &std::path::Path, settings: &Settings) -> Result<(
         renderer: None,
         gui: UiResources {
             atlas: HudAtlas::build(looked_in)?,
+            atlas_file: None,
             panorama: Arc::new(horizon_client::gfx::panorama::Faces {
                 size: 1,
                 pixels: [0u8; 4].repeat(6),
@@ -109,6 +110,7 @@ impl ApplicationHandler for Missing {
                     window.clone(),
                     false,
                     Some(&self.gui.atlas),
+                    self.gui.atlas_file.as_deref(),
                     Some(self.gui.panorama.as_ref()),
                     None,
                     self.api,

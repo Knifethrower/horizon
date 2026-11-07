@@ -234,7 +234,10 @@ impl Arena {
             && self.closing != Some(last as u32)
         {
             let current = page.capacity;
-            let grown = (current * 2).max(current + len).min(self.page_limit);
+            // Half again, not twice: doubling overshoots what a small render
+            // distance needs, and the extra vertices stay resident (a 1 GB
+            // handheld cannot spare the ~90 MiB a doubled page can waste).
+            let grown = (current + current / 2).max(current + len).min(self.page_limit);
             if (grown - current >= len || grown == self.page_limit)
                 && self.grow(device, encoder, last, grown)
                 && let Some(start) = self.pages[last].as_mut().unwrap().free.take(len)
@@ -272,6 +275,10 @@ impl Arena {
                 self.pages.len() - 1
             });
         self.pages[index] = Some(page);
+        log::info!(
+            "Horizon: terrain arena page {index} opened at {} MiB",
+            capacity * self.stride >> 20
+        );
         Some((index as u32, start))
     }
     /// A range of `vertices` in a page that exists already and is not being
@@ -413,6 +420,10 @@ impl Arena {
         old.host = host;
         old.capacity = capacity;
         old.free.give(previous, capacity - previous);
+        log::info!(
+            "Horizon: terrain arena page {page} grown to {} MiB",
+            capacity * self.stride >> 20
+        );
         true
     }
     /// Reclaim after an upload batch, so replacing a section can reuse its range.
