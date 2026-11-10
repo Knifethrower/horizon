@@ -64,6 +64,8 @@ mod entity_outline;
 mod fluid;
 #[cfg(test)]
 mod inter_stage_tests;
+#[cfg(test)]
+mod lean_terrain_tests;
 mod terrain_model;
 #[cfg(test)]
 pub(crate) mod test_gpu;
@@ -1179,6 +1181,39 @@ impl EntityResources {
     }
 }
 
+/// `solid_opaque` and `solid_cutout` for a lean frame (`lean_frame`), where only the sprite, the
+/// light and the fog apply: terrain.wgsl's `vs_terrain_lean_opaque` with `fs_lean_opaque`, and
+/// the cutout pair. A Mali-G31 runs them in half the registers (malioc: 32 for the vertex instead
+/// of 64, at most 32 for the pixel instead of 64, so twice the threads), a vertex exports 9
+/// values instead of 20 and a pixel's longest path is 6 cycles instead of 40 (7 and 52 cutting
+/// out). Only for per-section draws that take their vertices as vertices (no flat draws: OpenGL,
+/// mostly).
+struct LeanTerrain {
+    opaque: wgpu::RenderPipeline,
+    cutout: wgpu::RenderPipeline,
+}
+
+/// `HORIZON_LEAN_TERRAIN=0` keeps every frame on the full terrain shaders (`LeanTerrain`).
+fn lean_wanted() -> bool {
+    std::env::var("HORIZON_LEAN_TERRAIN").as_deref() != Ok("0")
+}
+
+/// Whether a frame's two solid passes can take `LeanTerrain`: nothing it leaves out is in play,
+/// as `globals` gives it to the shaders, and the lists draw sections alone (`whole_sections`:
+/// none fading over far terrain, no distant tile; vanilla's fade-in the lean shaders draw). A
+/// world warp, a pack's material and GPU culling draw no such passes anyway.
+fn lean_frame(globals: &Globals, whole_sections: bool) -> bool {
+    whole_sections
+        // HDR output's lighting and marks.
+        && globals.hdr_light[2] == 0.0
+        // RGSS: a lean pixel takes sampleNearest's one tap.
+        && globals.filtering[0] != 1.0
+        // Horizon Extras' dynamic lights, and a native mod's coloured lights and emissive layers.
+        && globals.time[2] == 0.0
+        && globals.colored_count[0] == 0
+        && globals.emissive_count[0] == 0
+}
+
 pub struct Renderer {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -1237,6 +1272,8 @@ pub struct Renderer {
     /// `solid` split in two passes for the world pass (terrain.wgsl's `opaque_quad`).
     solid_opaque: SolidPipeline,
     solid_cutout: SolidPipeline,
+    /// The two for a lean frame (`lean_frame`), where the per-section draws take vertices.
+    lean_terrain: Option<LeanTerrain>,
     translucent: wgpu::RenderPipeline,
     translucent_mark: wgpu::RenderPipeline,
     /// A native mod's world warp (`world_warp`): nothing made until a mod gives one.
@@ -5250,6 +5287,41 @@ impl Renderer {
             }
             None => (solid, solid_opaque, solid_cutout, solid_mirror),
         };
+        // A lean frame's solid passes (`LeanTerrain`), where the per-section draws take their
+        // vertices as vertices: without flat draws, whose page groups they otherwise read.
+        let lean_terrain = (flat.is_none() && lean_wanted()).then(|| {
+            log::info!(
+                "Horizon: lean terrain shaders for frames with only sprite, light and fog (HORIZON_LEAN_TERRAIN)"
+            );
+            let lean = |label: &str, vertex: &str, fragment: &str| {
+                pipeline_with(
+                    &plain_constants,
+                    &layout,
+                    label,
+                    vertex,
+                    fragment,
+                    &terrain_buffers,
+                    tri,
+                    Some(wgpu::Face::Back),
+                    true,
+                    true,
+                    None,
+                    None,
+                )
+            };
+            LeanTerrain {
+                opaque: lean(
+                    "Terrain solid opaque, lean",
+                    "vs_terrain_lean_opaque",
+                    "fs_lean_opaque",
+                ),
+                cutout: lean(
+                    "Terrain solid cutout, lean",
+                    "vs_terrain_lean_cutout",
+                    "fs_lean_cutout",
+                ),
+            }
+        });
         // The solid quads in the compact layout, while no shader pack reads the arena
         // (`follow_packed_layout`).
         let packed_quads = flat.is_some() && !shader_pack && packed_wanted();
@@ -5422,6 +5494,7 @@ impl Renderer {
             solid,
             solid_opaque,
             solid_cutout,
+            lean_terrain,
             translucent,
             translucent_mark,
             world_warps,
@@ -9213,6 +9286,8 @@ impl Renderer {
         // nothing is fading (the usual frame), every section is whole without a lookup.
         let fading_in = self.sections_fading_in(fade_ms, now);
         let fading_over_lods = self.sections_fading_over_lods(now);
+        // The lists draw sections alone, none dithered or set back for far terrain (`lean_frame`).
+        let whole_sections = !fading_over_lods && visible_lods.is_empty();
         let fade_code = move |section: &SectionGpu, key: &SectionKey| {
             if fading_over_lods {
                 section.fade(retiring.contains(key))
@@ -11178,15 +11253,20 @@ impl Renderer {
                     // and phase 2's lists with quads for it.
                     let (opaque, cutout) = (opaque_end as u32, cutout_start as u32);
                     type Draws = std::ops::Range<u32>;
+                    // A lean frame's two passes take the lean shaders (`LeanTerrain`).
+                    let (opaque_pipeline, cutout_pipeline) = match self
+                        .lean_terrain
+                        .as_ref()
+                        .filter(|_| lean_frame(&globals, whole_sections))
+                    {
+                        Some(lean) => (&lean.opaque, &lean.cutout),
+                        None => (self.solid_opaque.get(hdr), self.solid_cutout.get(hdr)),
+                    };
                     let passes: &[(&wgpu::RenderPipeline, Draws, Draws)] = match material {
                         None if split_solid => &[
+                            (opaque_pipeline, 0..opaque, phase1_draws..phase2_cutout),
                             (
-                                self.solid_opaque.get(hdr),
-                                0..opaque,
-                                phase1_draws..phase2_cutout,
-                            ),
-                            (
-                                self.solid_cutout.get(hdr),
+                                cutout_pipeline,
                                 cutout..phase1_draws,
                                 phase2_cutout..solid_draws,
                             ),
@@ -14665,6 +14745,62 @@ mod tests {
             )
             .and_then(|mut w| w.write())
             .unwrap_or_else(|e| panic!("{entry}: {e}"));
+        }
+    }
+    #[test]
+    fn lean_terrain_shaders_translate_for_opengl() {
+        // `LeanTerrain` is built where there are no flat draws, OpenGL above all, whose GLSL the
+        // other test leaves out of terrain.wgsl (its flat entries read storage buffers). The
+        // lean entries read none: they run where a vertex shader can't read one.
+        let module = naga::front::wgsl::parse_str(&super::terrain_shader()).unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let constants = [("HDR_LIGHTING".to_owned(), 0.0)].into_iter().collect();
+        use naga::ShaderStage::{Fragment, Vertex};
+        for (stage, entry) in [
+            (Vertex, "vs_terrain_lean_opaque"),
+            (Vertex, "vs_terrain_lean_cutout"),
+            (Fragment, "fs_lean_opaque"),
+            (Fragment, "fs_lean_cutout"),
+        ] {
+            let (module, info) = naga::back::pipeline_constants::process_overrides(
+                &module,
+                &info,
+                Some((stage, entry)),
+                &constants,
+            )
+            .unwrap();
+            for version in [
+                naga::back::glsl::Version::Embedded {
+                    version: 300,
+                    is_webgl: false,
+                },
+                naga::back::glsl::Version::Desktop(330),
+            ] {
+                let mut glsl = String::new();
+                naga::back::glsl::Writer::new(
+                    &mut glsl,
+                    &module,
+                    &info,
+                    &naga::back::glsl::Options {
+                        version,
+                        ..Default::default()
+                    },
+                    &naga::back::glsl::PipelineOptions {
+                        shader_stage: stage,
+                        entry_point: entry.to_owned(),
+                        multiview: None,
+                    },
+                    Default::default(),
+                )
+                .and_then(|mut w| w.write())
+                .unwrap_or_else(|e| panic!("{entry} ({version:?}): {e}"));
+                assert!(!glsl.contains(" buffer "), "{entry} reads a storage buffer");
+            }
         }
     }
     #[test]

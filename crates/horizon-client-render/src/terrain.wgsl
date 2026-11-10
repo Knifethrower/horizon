@@ -82,6 +82,10 @@ fn sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<
     if (animated_layer != 0xFFFFFFFFu) {
         return textureSampleGrad(animated, sprite_sampler, uv, i32(animated_layer), dx, dy);
     }
+    return stored_sprite_grad(uv, layer, dx, dy);
+}
+// The same for a sprite that does not animate, from the arrays its layer is in.
+fn stored_sprite_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     let l = i32(layer % SPRITE_SPLIT);
     if SPRITE_ARRAYS == 1u {
         return textureSampleGrad(sprites, sprite_sampler, uv, l, dx, dy);
@@ -124,12 +128,7 @@ fn sprite_level(uv: vec2<f32>, layer: u32, lod: f32) -> vec4<f32> {
 // sprites while `uv` stays inside one (see `tile_uv` below).
 fn sample_nearest(uv: vec2<f32>, layer: u32, pixel: vec2<f32>, du: vec2<f32>, dv: vec2<f32>,
                   texel_screen: vec2<f32>, tiled: bool) -> vec4<f32> {
-    let texel_coords = uv / pixel;
-    let center = round(texel_coords) - 0.5;
-    var offset = texel_coords - center;
-    offset = (offset - 0.5) * pixel / max(texel_screen, vec2(1e-12)) + 0.5;
-    offset = clamp(offset, vec2(0.0), vec2(1.0));
-    let at = (center + offset) * pixel;
+    let at = nearest_uv(uv, pixel, texel_screen);
     if tiled {
         // An anisotropic sampler lays its taps along those gradients, past the sprite's edge,
         // where the clamped sampler reads that edge texel again: long streaks on the far tiles.
@@ -138,6 +137,16 @@ fn sample_nearest(uv: vec2<f32>, layer: u32, pixel: vec2<f32>, du: vec2<f32>, dv
         return sprite_level(at, layer, max(0.0, log2(level)));
     }
     return sprite_grad(at, layer, du, dv);
+}
+// Where sampleNearest takes its one tap: the texel's centre, moved toward its neighbour only
+// within the screen pixel at their edge.
+fn nearest_uv(uv: vec2<f32>, pixel: vec2<f32>, texel_screen: vec2<f32>) -> vec2<f32> {
+    let texel_coords = uv / pixel;
+    let center = round(texel_coords) - 0.5;
+    var offset = texel_coords - center;
+    offset = (offset - 0.5) * pixel / max(texel_screen, vec2(1e-12)) + 0.5;
+    offset = clamp(offset, vec2(0.0), vec2(1.0));
+    return (center + offset) * pixel;
 }
 // sampleRGSS: four rotated-grid samples of the two nearest mip levels, faded in as the texels
 // shrink below two screen pixels, over sample_nearest.
@@ -710,12 +719,17 @@ fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f3
     out.spherical = length(pos);
     out.cylindrical = max(length(pos.xz), abs(pos.y));
     out.fade = fade_code(w);
-    const CHUNK_FULLY_VISIBLE_RANGE: f32 = 16.0;
-    out.visibility = mix(1.0, instance_visibility(w),
-        clamp((length(pos) - CHUNK_FULLY_VISIBLE_RANGE) / CHUNK_FULLY_VISIBLE_RANGE, 0.0, 1.0));
+    out.visibility = chunk_visibility(pos, w);
     // [world warp out]
     // [end world warp out]
     return out;
+}
+// terrain.vsh's chunkVisibility at the camera-relative `pos`: its section's fade-in, from 16
+// blocks out.
+fn chunk_visibility(pos: vec3<f32>, w: f32) -> f32 {
+    const CHUNK_FULLY_VISIBLE_RANGE: f32 = 16.0;
+    return mix(1.0, instance_visibility(w),
+        clamp((length(pos) - CHUNK_FULLY_VISIBLE_RANGE) / CHUNK_FULLY_VISIBLE_RANGE, 0.0, 1.0));
 }
 fn linear_fog(d: f32, start: f32, end: f32) -> f32 {
     if d <= start { return 0.0; }
@@ -834,6 +848,102 @@ fn solid_finish_at(in: TerrainOut, texel: vec4<f32>, color: vec4<f32>, du: vec2<
         return apply_fog(vec4(mix(color.rgb, mask.rgb, mask.a), mix(emissive, hdr_mark(3u, 1.0), mask.a)), in.spherical, in.cylindrical);
     }
     return apply_fog(vec4(color.rgb, emissive), in.spherical, in.cylindrical);
+}
+// The two solid passes of a frame where nothing but the sprite, the light and the fog applies
+// (gfx.rs's `lean_frame`): sections only, none fading over far terrain (vanilla's fade-in stays),
+// no distant tiles, no HDR output, no emissive layers, no dynamic or coloured lights, no RGSS, no
+// world warp, no pack. There most of what `terrain_vertex` exports and `fs_opaque`/`fs_solid`
+// work out comes to nothing, and a Mali GPU pays for it all the same: a vertex for each value it
+// exports, a pixel for the registers of every path it could take (past 32, half the threads
+// run). These draw the same picture from 9 values a vertex instead of 20 and a pixel with one
+// path.
+struct LeanWire {
+    @builtin(position) clip: vec4<f32>,
+    // The lit colour, and the spherical fog distance.
+    @location(0) a: vec4<f32>,
+    // The UV, the cylindrical fog distance and the fade-in (`chunk_visibility`).
+    @location(1) b: vec4<f32>,
+    // The sprite's layer, in `animated` with LEAN_ANIMATED (the vertex looked it up, so a pixel
+    // doesn't) or else in the sprite arrays; LEAN_WHOLE for a quad without cutout (bit 15).
+    @location(2) @interpolate(flat) layer: u32,
+}
+const LEAN_ANIMATED: u32 = 0x40000000u;
+const LEAN_WHOLE: u32 = 0x80000000u;
+// `terrain_vertex` for a section with none of those features: `fade_depth` scales by 1, the
+// block light is the vertex's own.
+fn lean_vertex(position: vec3<f32>, uv: vec2<u32>, layer: u32, color: vec4<f32>, light: vec2<u32>,
+    origin: vec4<f32>) -> LeanWire {
+    let pos = position + origin.xyz;
+    var out: LeanWire;
+    out.clip = globals.view_proj * vec4(pos, 1.0);
+    let sprite = layer & 0x7fffu;
+    let animated_layer = textureLoad(layer_map, vec2<i32>(i32(sprite), 0), 0).r;
+    out.layer = select(sprite, animated_layer | LEAN_ANIMATED, animated_layer != 0xFFFFFFFFu)
+        | select(0u, LEAN_WHOLE, (layer & 0x8000u) != 0u);
+    let lit = vec4(color.rgb, 1.0) * sample_lightmap(f32(light.x) / 16.0, f32(light.y) / 16.0);
+    out.a = vec4(lit.rgb, length(pos));
+    out.b = vec4(terrain_uv(uv, origin.w), max(length(pos.xz), abs(pos.y)),
+        chunk_visibility(pos, origin.w));
+    return out;
+}
+// The other pass's quads of an unsorted mesh are left out by their position alone (`left_out`):
+// the rest is worked out all the same, which few vertices pay for, and which keeps the cutout
+// pass's shader in 32 registers (malioc gave its early return 56, at half the threads).
+@vertex fn vs_terrain_lean_opaque(
+    @location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
+    @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>,
+    @location(5) origin: vec4<f32>) -> LeanWire {
+    var out = lean_vertex(position, uv, layer, color, light, origin);
+    if !opaque_quad(layer, origin.w) { out.clip = left_out().clip; }
+    return out;
+}
+@vertex fn vs_terrain_lean_cutout(
+    @location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
+    @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>,
+    @location(5) origin: vec4<f32>) -> LeanWire {
+    var out = lean_vertex(position, uv, layer, color, light, origin);
+    if opaque_quad(layer, origin.w) { out.clip = left_out().clip; }
+    return out;
+}
+// `sprite_at`'s sampleNearest for a section's face: its UVs stay inside the sprite, so neither
+// `tile_uv`'s wrap nor a distant tile's single level applies. (Where a UV interpolates a hair
+// past 1 on a face's edge, `sprite_at` takes it for a tile's next block and samples the other
+// side of the sprite; this takes the sprite's own edge, a few pixels a frame.)
+fn lean_texel(w: LeanWire) -> vec4<f32> {
+    let du = dpdx(w.b.xy);
+    let dv = dpdy(w.b.xy);
+    let at = nearest_uv(w.b.xy, vec2(1.0 / globals.filtering.y), sqrt(du * du + dv * dv));
+    let layer = w.layer & ~(LEAN_ANIMATED | LEAN_WHOLE);
+    if (w.layer & LEAN_ANIMATED) != 0u {
+        return textureSampleGrad(animated, sprite_sampler, at, i32(layer), du, dv);
+    }
+    return stored_sprite_grad(at, layer, du, dv);
+}
+// `linear_fog` without its branches, a cycle of a lean pixel's seven (malioc). Where the fog
+// ends past its start the two agree. Where it ends at its start or before (no environmental
+// fog: both f32::MAX; a fog fading in from nothing) a distance short of the start gives 0 and
+// one past it 1, as there, but within a millionth of a block of it. The floor keeps it from
+// dividing by 0, which GLSL leaves undefined (llvmpipe's OpenGL made it no fog at all).
+fn lean_fog(d: f32, start: f32, end: f32) -> f32 {
+    return clamp((d - start) / max(end - start, 1e-6), 0.0, 1.0);
+}
+// `fs_opaque`'s colour past its texel, and `solid_finish` with no emission and no overlay.
+fn lean_finish(w: LeanWire, texel: vec4<f32>) -> vec4<f32> {
+    // terrain.fsh: the fade-in mixes toward the fog colour.
+    let color = mix(globals.fog_color.rgb, texel.rgb * w.a.rgb, w.b.w);
+    let f = max(lean_fog(w.a.w, globals.fog.x, globals.fog.y),
+        lean_fog(w.b.z, globals.fog.z, globals.fog.w));
+    return solid_light(vec4(mix(color, globals.fog_color.rgb, f * globals.fog_color.a), 1.0));
+}
+// `fs_opaque` of a lean frame.
+@fragment fn fs_lean_opaque(w: LeanWire) -> @location(0) vec4<f32> {
+    return lean_finish(w, lean_texel(w));
+}
+// `fs_solid` of a lean frame: the cutout pass, with no fading tile or section to dither.
+@fragment fn fs_lean_cutout(w: LeanWire) -> @location(0) vec4<f32> {
+    let texel = lean_texel(w);
+    if texel.a < 0.5 && (w.layer & LEAN_WHOLE) == 0u { discard; }
+    return lean_finish(w, texel);
 }
 // HDR lighting on what's mostly opaque among translucent faces (water), drawn again after
 // them with only alpha written: `fs_translucent` blends its alpha as coverage, so a lake's
