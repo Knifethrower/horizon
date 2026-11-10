@@ -356,9 +356,12 @@ fn retained_gpu_draw_matches_transient_additive_draw() {
         )
         .create_view(&Default::default());
     let sampler = device.create_sampler(&Default::default());
+    // The atlas is one white texel: the shared atlas's other parts say it is whole.
+    let parts = crate::gfx::shared_atlas::Parts::whole(&device);
     let groups: Vec<_> = pipelines
         .iter()
         .map(|pipeline| {
+            let [dynamic, pages] = parts.entries();
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipeline.get_bind_group_layout(0),
@@ -383,6 +386,8 @@ fn retained_gpu_draw_matches_transient_additive_draw() {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(&sampler),
                     },
+                    dynamic,
+                    pages,
                 ],
             })
         })
@@ -645,7 +650,10 @@ fn bolt_through_the_atlas_white_sprite_is_fully_drawn() {
         height: size,
         depth_or_array_layers: 1,
     };
+    // Each atlas here is one texture: the shared atlas's other parts say so.
+    let parts = crate::gfx::shared_atlas::Parts::whole(&device);
     let draw = |view: &wgpu::TextureView, uv: [f32; 2]| -> Vec<u8> {
+        let [dynamic, pages] = parts.entries();
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
@@ -670,6 +678,8 @@ fn bolt_through_the_atlas_white_sprite_is_fully_drawn() {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
+                dynamic,
+                pages,
             ],
         });
         let bolts = [Bolt {

@@ -174,6 +174,9 @@ fn separate_draws_match_combined_celestial_pixels() {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    // The atlas is one texture here: the shared atlas's other parts say so.
+    let parts = crate::gfx::shared_atlas::Parts::whole(&device);
+    let [dynamic, pages] = parts.entries();
     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
@@ -198,6 +201,8 @@ fn separate_draws_match_combined_celestial_pixels() {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
+            dynamic,
+            pages,
         ],
     });
     let indices = Renderer::quad_indices(&device, VERTICES / 4 + 1);

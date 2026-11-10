@@ -61,8 +61,11 @@ impl WorldPrimitives {
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("World primitives"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("world_primitives.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                super::shared_atlas::with(include_str!("world_primitives.wgsl")).into(),
+            ),
         });
+        let [dynamic, pages] = super::shared_atlas::layout_entries(wgpu::ShaderStages::FRAGMENT);
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("World primitives"),
             entries: &[
@@ -92,6 +95,8 @@ impl WorldPrimitives {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                dynamic,
+                pages,
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -225,7 +230,7 @@ impl WorldPrimitives {
         batch: &Batch<'_>,
         view_proj: Mat4,
         viewport: [u32; 2],
-        atlas: &wgpu::TextureView,
+        atlas: &super::shared_atlas::SharedAtlas,
     ) -> bool {
         let quads = [batch.quads, batch.quads_through].map(|q| (q.len() / 4) as u32);
         let lines = [batch.lines, batch.lines_through].map(|l| l.len() as u32);
@@ -279,6 +284,8 @@ impl WorldPrimitives {
             viewport: [viewport[0] as f32, viewport[1] as f32, 0.0, 0.0],
         };
         upload(&self.globals, bytemuck::bytes_of(&globals));
+        let parts = atlas.parts();
+        let [dynamic, pages] = parts.entries();
         self.group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("World primitives"),
             layout: &self.layout,
@@ -289,12 +296,14 @@ impl WorldPrimitives {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(atlas),
+                    resource: wgpu::BindingResource::TextureView(atlas.view()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
+                dynamic,
+                pages,
             ],
         }));
         true
@@ -433,21 +442,9 @@ mod tests {
             wgpu::TextureUsages::RENDER_ATTACHMENT,
         );
         // The atlas: one white texel, what plain colours sample.
-        let atlas = texture(
-            1,
-            format,
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        );
-        queue.write_texture(
-            atlas.as_image_copy(),
-            &[255; 4],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: None,
-            },
-            atlas.size(),
-        );
+        let source = (&[255u8; 4][..], 1, 1).into();
+        let atlas =
+            super::super::shared_atlas::SharedAtlas::new(&device, &queue, &source, None).unwrap();
 
         let (half, full) = (SIZE as f32 / 2.0, SIZE as f32);
         // Top left: behind the wall, depth tested. Top right: behind it, through walls.
@@ -469,14 +466,13 @@ mod tests {
         };
 
         let mut primitives = WorldPrimitives::new(&device, format);
-        let atlas_view = atlas.create_view(&Default::default());
         assert!(primitives.prepare(
             &device,
             &mut |buffer, bytes| queue.write_buffer(buffer, 0, bytes),
             &batch,
             view_proj,
             [SIZE, SIZE],
-            &atlas_view,
+            &atlas,
         ));
         let mut encoder = device.create_command_encoder(&Default::default());
         {

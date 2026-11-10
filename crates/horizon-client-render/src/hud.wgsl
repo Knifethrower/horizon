@@ -6,6 +6,8 @@ struct Hud {
     end_portal: array<vec4<f32>, 3>,
 }
 @group(0) @binding(0) var<uniform> hud: Hud;
+// The shared atlas's static bands, or a GUI picture: read it through
+// shared_atlas.wgsl (appended).
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
 // enchanted_glint_item on its own repeating texture (vanilla's GlintSampler).
@@ -39,7 +41,7 @@ struct Out {
     if in.uv.x >= 2.0 {
         let armor = in.uv.x >= 4.0;
         let offset = select(2.0, 4.0, armor);
-        let mask = textureSample(atlas, atlas_sampler, in.uv - vec2(offset, 0.0)).a;
+        let mask = atlas_sample(atlas_sampler, in.uv - vec2(offset, 0.0)).a;
         let item_sample = textureSample(glint_tex, glint_sampler, in.glint_uv);
         let armor_sample = textureSample(glint_armor_tex, glint_sampler, in.glint_uv);
         if mask < 0.1 { discard; }
@@ -50,7 +52,7 @@ struct Out {
         }
         return vec4(glint.rgb * glint.rgb, mask);
     }
-    let c = textureSample(atlas, atlas_sampler, in.uv) * in.color;
+    let c = atlas_sample(atlas_sampler, in.uv) * in.color;
     if c.a < 0.004 { discard; }
     return c;
 }
@@ -70,7 +72,7 @@ struct CitSlots {
 @group(1) @binding(2) var cit_nearest: sampler;
 @group(1) @binding(3) var<uniform> cit: CitSlots;
 @fragment fn fs_cit_glint(in: Out) -> @location(0) vec4<f32> {
-    let mask = textureSample(atlas, atlas_sampler, in.uv).a;
+    let mask = atlas_sample(atlas_sampler, in.uv).a;
     let index = u32(round(in.color.r * 255.0));
     let slot = cit.slots[index];
     let blurred = textureSampleLevel(cit_tex, cit_blur, in.glint_uv, index, 0.0);
@@ -84,14 +86,14 @@ struct CitSlots {
     return t;
 }
 @fragment fn fs_crosshair(in: Out) -> @location(0) vec4<f32> {
-    let c = textureSample(atlas, atlas_sampler, in.uv) * in.color;
+    let c = atlas_sample(atlas_sampler, in.uv) * in.color;
     if c.a == 0.0 { discard; }
     return c;
 }
 // RenderPipelines.VIGNETTE (WinScreen's credits vignette): bilinear sample of
 // credits_vignette.png (which has blur: true in its .mcmeta and a wrapped border in the atlas).
 @fragment fn fs_vignette(in: Out) -> @location(0) vec4<f32> {
-    let c = textureSample(atlas, linear_sampler, in.uv) * in.color;
+    let c = atlas_linear(linear_sampler, in.uv) * in.color;
     return vec4(c.rgb, 1.0);
 }
 // rendertype_end_portal.fsh (entity.wgsl has the same for portal blocks).
@@ -115,7 +117,7 @@ const PORTAL_COLORS = array<vec3<f32>, 16>(
 );
 fn portal_sample(rect: vec4<f32>, p: vec4<f32>) -> vec3<f32> {
     let st = fract(p.xy / p.w);
-    return textureSampleLevel(atlas, atlas_sampler, rect.xy + st * rect.zw, 0.0).rgb;
+    return atlas_sample(atlas_sampler, rect.xy + st * rect.zw).rgb;
 }
 fn portal_layer(p: vec4<f32>, layer: f32) -> vec4<f32> {
     let a = radians((layer * layer * 4321.0 + layer * 9.0) * 2.0);

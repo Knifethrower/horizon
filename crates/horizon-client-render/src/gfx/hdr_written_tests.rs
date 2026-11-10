@@ -390,9 +390,17 @@ impl<'a> Draw<'a> {
                 count: None,
             });
         }
+        // The shared atlas's other parts beside the entities' one-texture atlas.
+        let parts = super::super::shared_atlas::Parts::whole(device);
+        let atlas_parts =
+            super::super::shared_atlas::layout_entries(wgpu::ShaderStages::VERTEX_FRAGMENT);
         let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            entries: &entries,
+            entries: &if terrain {
+                entries.clone()
+            } else {
+                [&entries[..], &atlas_parts].concat()
+            },
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
@@ -454,7 +462,7 @@ impl<'a> Draw<'a> {
             )
             .create_view(&Default::default());
         let sampler = device.create_sampler(&Default::default());
-        let resources: Vec<_> = entries
+        let mut resources: Vec<_> = entries
             .iter()
             .map(|entry| wgpu::BindGroupEntry {
                 binding: entry.binding,
@@ -473,6 +481,9 @@ impl<'a> Draw<'a> {
                 },
             })
             .collect();
+        if !terrain {
+            resources.extend(parts.entries());
+        }
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &bindings,

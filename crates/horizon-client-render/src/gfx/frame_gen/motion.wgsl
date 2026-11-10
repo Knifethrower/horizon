@@ -44,7 +44,7 @@ struct Out {
     let tolerance = stored * 1e-3 + 1e-7;
     // Not what the world shows here: a transparent texel, or behind something.
     if in.translucent != 0u {
-        let alpha = textureSampleLevel(atlas, atlas_sampler, in.uv, 0.0).a;
+        let alpha = atlas_sample(atlas_sampler, in.uv).a;
         if alpha < 0.1 || in.clip.z < stored - tolerance {
             discard;
         }

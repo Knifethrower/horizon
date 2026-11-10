@@ -101,7 +101,7 @@ pub(super) fn build_renderer(
         assets.texture_layers,
         &assets.sprite_mips,
         &assets.animations,
-        (&atlas_pixels, atlas.width, atlas.height),
+        atlas.source(&atlas_pixels),
         gui.atlas_file.as_deref(),
         (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
         (
@@ -132,9 +132,11 @@ pub(super) fn build_renderer(
         .iter()
         .map(|(rect, animation)| (*rect, animation.clone(), (usize::MAX, 0, 0)))
         .collect();
-    renderer
-        .hud
-        .set_text_shader(&renderer.device, atlas.text_shader.as_deref());
+    renderer.hud.set_text_shader(
+        &renderer.device,
+        &renderer.queue,
+        atlas.text_shader.as_deref(),
+    );
     pack.item_renderer
         .prepare_glint_atlas(renderer.device.limits().max_texture_dimension_2d, filtering)?;
     renderer.set_lines_shader(atlas.lines_shader.as_deref());
@@ -166,9 +168,10 @@ pub(super) fn loading_renderer(
     let panorama = panorama
         .cloned()
         .unwrap_or_else(|| Arc::new(horizon_client::gfx::panorama::Faces::colour([0; 4])));
-    let (pixels, width, height) = atlas.map_or((EMPTY_HUD.as_slice(), 1, 1), |a| {
-        (a.pixels.as_slice(), a.width, a.height)
-    });
+    let hud_atlas = atlas.map_or_else(
+        || (EMPTY_HUD.as_slice(), 1, 1).into(),
+        |a| a.source(&a.pixels),
+    );
     let (glint_pixels, glint_width, glint_height) = atlas
         .map_or((EMPTY_GLINT.as_slice(), 1, 1), |a| {
             (a.glint.0.as_slice(), a.glint.1, a.glint.2)
@@ -188,7 +191,7 @@ pub(super) fn loading_renderer(
         1,
         &[],
         &[],
-        (pixels, width, height),
+        hud_atlas,
         atlas_file,
         (glint_pixels, glint_width, glint_height),
         (glint_pixels, glint_width, glint_height),

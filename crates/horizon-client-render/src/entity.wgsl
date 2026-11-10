@@ -39,6 +39,7 @@ struct Globals {
     hdr_shares: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
+// The shared atlas's static bands: read it through shared_atlas.wgsl (appended).
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
 @group(0) @binding(3) var lightmap: texture_2d<f32>;
@@ -225,7 +226,7 @@ const PORTAL_COLORS = array<vec3<f32>, 16>(
 // textureProj on a repeating texture that lives in the atlas at `rect`.
 fn portal_sample(rect: vec4<f32>, p: vec4<f32>) -> vec3<f32> {
     let st = fract(p.xy / p.w);
-    return textureSampleLevel(atlas, atlas_sampler, rect.xy + st * rect.zw, 0.0).rgb;
+    return atlas_sample(atlas_sampler, rect.xy + st * rect.zw).rgb;
 }
 // texProj0 * end_portal_layer(layer): the row vector through mat4(scale * rotate),
 // translate and SCALE_TRANSLATE in turn.
@@ -303,14 +304,14 @@ fn entity_color(in: Out, front: bool) -> vec4<f32> {
     if in.overlay == 6u { uv.y = in.wrap.x + fract(in.uv.y) * in.wrap.y; }
     if in.overlay == 11u || in.overlay == 12u {
         // Each crack's stage sprite origin comes in its light bytes (breaking::stage_light).
-        uv = crumbling_uv(in.uv, in.wrap, globals.crumbling_sprite.zw, textureDimensions(atlas));
+        uv = crumbling_uv(in.uv, in.wrap, globals.crumbling_sprite.zw, atlas_size());
     }
-    let texel = textureSample(atlas, atlas_sampler, uv);
+    let texel = atlas_sample(atlas_sampler, uv);
     var tint = select(in.back_color, in.color, front);
     if in.overlay == 38u {
         // RenderPipelines.ENTITY_CUTOUT_DISSOLVE (entity.fsh's DISSOLVE): gone where the vertex
         // alpha is below the mask's (its atlas UV in glint_uv), the rest drawn opaque.
-        if tint.a < textureSampleLevel(atlas, atlas_sampler, in.glint_uv, 0.0).a { discard; }
+        if tint.a < atlas_sample(atlas_sampler, in.glint_uv).a { discard; }
         tint.a = 1.0;
     }
     var color = texel * tint;
@@ -357,7 +358,7 @@ fn entity_color(in: Out, front: bool) -> vec4<f32> {
     return shadow_color(in);
 }
 fn shadow_color(in: Out) -> vec4<f32> {
-    var color = textureSample(atlas, atlas_sampler, in.uv) * in.color;
+    var color = atlas_sample(atlas_sampler, in.uv) * in.color;
     color *= in.light_color;
     let f = max(linear_fog(in.fog_distance.x, globals.fog.x, globals.fog.y),
                 linear_fog(in.fog_distance.y, globals.fog.z, globals.fog.w));
@@ -365,7 +366,7 @@ fn shadow_color(in: Out) -> vec4<f32> {
 }
 
 @fragment fn fs_outline(in: Out) -> @location(0) vec4<f32> {
-    if textureSample(atlas, atlas_sampler, in.uv).a == 0.0 { discard; }
+    if atlas_sample(atlas_sampler, in.uv).a == 0.0 { discard; }
     return vec4(in.color.rgb, 1.0);
 }
 
@@ -376,14 +377,14 @@ fn shadow_color(in: Out) -> vec4<f32> {
     // Beams wrap their v in the sprite as fs_entity does: sample where they draw.
     var uv = in.uv;
     if in.overlay == 6u { uv.y = in.wrap.x + fract(in.uv.y) * in.wrap.y; }
-    let texel = textureSample(atlas, atlas_sampler, uv);
+    let texel = atlas_sample(atlas_sampler, uv);
     if texel.a < 0.1 { discard; }
     return vec4(0.0, 0.0, 0.0, hdr_entity_mark(in));
 }
 fn hdr_entity_mark(in: Out) -> f32 {
     var uv = in.uv;
     if in.overlay == 6u { uv.y = in.wrap.x + fract(in.uv.y) * in.wrap.y; }
-    let texel = textureSample(atlas, atlas_sampler, uv);
+    let texel = atlas_sample(atlas_sampler, uv);
     // Additive and procedural colour draws can survive where the legacy mark pass skips.
     if texel.a < 0.1 { return 1.0; }
     // Fog hides a light source and the light on a surface as it hides everything else.
@@ -412,7 +413,7 @@ fn hdr_mark(tier: u32, y: f32) -> f32 {
 // The hand in HDR output (gfx.rs "HDR hand marks"): where it drew, what the world kept there
 // no longer shines; fs_hdr_mark then marks the light sources it holds.
 @fragment fn fs_hdr_hand_unmark(in: Out) -> @location(0) vec4<f32> {
-    if textureSample(atlas, atlas_sampler, in.uv).a < 0.1 { discard; }
+    if atlas_sample(atlas_sampler, in.uv).a < 0.1 { discard; }
     return vec4(0.0, 0.0, 0.0, hdr_scene_alpha(in.scene));
 }
 
@@ -432,7 +433,7 @@ fn celestial_color(in: Out) -> vec4<f32> {
                       linear_fog(in.fog_distance.y, globals.fog.z, globals.fog.w));
         return in.color * (1.0 - fog);
     }
-    let color = textureSample(atlas, atlas_sampler, in.uv) * in.color * in.light_color;
+    let color = atlas_sample(atlas_sampler, in.uv) * in.color * in.light_color;
     if in.overlay == 45u {
         // A Polytone custom particle drawn additively: the fog over its colour, as vanilla's
         // particle.fsh, under the additive blend (no alpha cutout: its faint texels add up).
@@ -480,7 +481,7 @@ fn celestial_color(in: Out) -> vec4<f32> {
 fn energy_swirl_base(in: Out) -> vec4<f32> {
     let bytes = round(in.color * 255.0);
     let size = vec2(bytes.x + bytes.y * 256.0, bytes.z + bytes.w * 256.0) / 65535.0;
-    let color = textureSample(atlas, atlas_sampler, crumbling_uv(in.uv, in.wrap, size, textureDimensions(atlas)));
+    let color = atlas_sample(atlas_sampler, crumbling_uv(in.uv, in.wrap, size, atlas_size()));
     if color.a < 0.1 { discard; }
     return vec4(color.rgb * (128.0 / 255.0), color.a);
 }
@@ -625,8 +626,8 @@ struct WeatherTime { values: vec4<f32> }
 fn weather_color(in: Out) -> vec4<f32> {
     // Repeat within this sprite, never across the atlas. The atlas uses nearest
     // filtering and no mipmaps, so fractional UVs have no seam derivatives.
-    let texel = weather_texel(in.uv, in.weather_rect, textureDimensions(atlas));
-    var color = textureLoad(atlas, texel, 0) * in.color;
+    let texel = weather_texel(in.uv, in.weather_rect, atlas_size());
+    var color = atlas_load(texel) * in.color;
     if color.a < 0.1 { discard; }
     color *= in.light_color;
     let f = max(linear_fog(in.fog_distance.x, globals.fog.x, globals.fog.y),

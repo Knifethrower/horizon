@@ -2,6 +2,7 @@
 // one sprite rectangle of the shared 2D atlas as if it were its own texture,
 // with the sampler vanilla gives it (ReloadableTexture.setSampler: linear
 // when `blur`, clamp-to-edge when `clamp`, else nearest and repeat).
+// The shared atlas's static bands: read it through shared_atlas.wgsl (appended).
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 // The block sprites' sampler (nearest), and the entity group's lightmap
 // sampler (linear) for `blur`. A blurred sprite has a one-texel border in the
@@ -30,7 +31,7 @@ struct Out {
     out.uv = uv;
     out.rect = rect;
     out.color = color;
-    let half = 0.5 / vec2<f32>(textureDimensions(atlas));
+    let half = 0.5 / vec2<f32>(atlas_size());
     out.edges = vec4(rect.xy + half, rect.zw - half);
     return out;
 }
@@ -52,18 +53,18 @@ fn screen(c: vec4<f32>) -> vec4<f32> {
     return c;
 }
 @fragment fn fs_screen(in: Out) -> @location(0) vec4<f32> {
-    return screen(textureSampleLevel(atlas, nearest_sampler, atlas_uv(in), 0.0) * in.color);
+    return screen(atlas_sample(nearest_sampler, atlas_uv(in)) * in.color);
 }
 @fragment fn fs_screen_blur(in: Out) -> @location(0) vec4<f32> {
-    return screen(textureSampleLevel(atlas, linear_sampler, atlas_uv(in), 0.0) * in.color);
+    return screen(atlas_linear(linear_sampler, atlas_uv(in)) * in.color);
 }
 // RenderPipelines.VIGNETTE blends ZERO, ONE_MINUS_SRC_COLOR: output the
 // texture colour; the blend state darkens the frame by it.
 @fragment fn fs_vignette(in: Out) -> @location(0) vec4<f32> {
-    let c = textureSampleLevel(atlas, nearest_sampler, atlas_uv(in), 0.0) * in.color;
+    let c = atlas_sample(nearest_sampler, atlas_uv(in)) * in.color;
     return vec4(c.rgb, 1.0);
 }
 @fragment fn fs_vignette_blur(in: Out) -> @location(0) vec4<f32> {
-    let c = textureSampleLevel(atlas, linear_sampler, atlas_uv(in), 0.0) * in.color;
+    let c = atlas_linear(linear_sampler, atlas_uv(in)) * in.color;
     return vec4(c.rgb, 1.0);
 }

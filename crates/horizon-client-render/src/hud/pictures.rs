@@ -174,6 +174,7 @@ impl HudRenderer {
                     address_mode_v: address,
                     ..Default::default()
                 });
+                let [dynamic, pages] = self.whole_parts.entries();
                 let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("GUI picture"),
                     layout: &self.layout,
@@ -192,7 +193,7 @@ impl HudRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&self.atlas_view),
+                            resource: wgpu::BindingResource::TextureView(self.atlas.view()),
                         },
                         wgpu::BindGroupEntry {
                             binding: 4,
@@ -204,8 +205,11 @@ impl HudRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 6,
-                            resource: wgpu::BindingResource::TextureView(&self.atlas_view),
+                            resource: wgpu::BindingResource::TextureView(self.atlas.view()),
                         },
+                        // The picture is a whole texture of its own: read as it is.
+                        dynamic,
+                        pages,
                     ],
                 });
                 (picture.clone(), group)

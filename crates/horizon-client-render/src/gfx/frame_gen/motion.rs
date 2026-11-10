@@ -5,9 +5,15 @@
 //! own motion, limbs and spin included, drawn into a texture at the render size
 //! (`motion.wgsl`) that the interpolation reads before the camera's.
 
+use super::super::shared_atlas::{self, SharedAtlas};
 use crate::mesher::Vertex;
 use glam::{DVec3, Mat4, Vec3};
 use std::collections::HashMap;
+
+/// `motion.wgsl`, with the shared atlas's reads.
+fn shader() -> String {
+    shared_atlas::with(include_str!("motion.wgsl"))
+}
 
 /// `motion.wgsl`'s `Params`.
 #[repr(C)]
@@ -31,7 +37,7 @@ struct MotionVertex {
 
 pub struct ObjectMotion {
     pipeline: wgpu::RenderPipeline,
-    atlas: wgpu::TextureView,
+    atlas: SharedAtlas,
     sampler: wgpu::Sampler,
     params: wgpu::Buffer,
     vertices: wgpu::Buffer,
@@ -47,10 +53,10 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 impl ObjectMotion {
     /// `atlas`: the entities' texture atlas.
-    pub fn new(device: &wgpu::Device, atlas: wgpu::TextureView) -> Self {
+    pub fn new(device: &wgpu::Device, atlas: SharedAtlas) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Frame generation motion"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("motion.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader().into()),
         });
         let attributes =
             wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Uint32];
@@ -192,6 +198,8 @@ impl ObjectMotion {
             previous: previous.to_cols_array_2d(),
         };
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
+        let parts = self.atlas.parts();
+        let [dynamic, pages] = parts.entries();
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Frame generation motion"),
             layout: &self.pipeline.get_bind_group_layout(0),
@@ -206,12 +214,14 @@ impl ObjectMotion {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.atlas),
+                    resource: wgpu::BindingResource::TextureView(self.atlas.view()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
+                dynamic,
+                pages,
             ],
         });
         let attachments = [Some(wgpu::RenderPassColorAttachment {
@@ -254,7 +264,7 @@ mod tests {
 
     #[test]
     fn shader_validates() {
-        let module = naga::front::wgsl::parse_str(include_str!("motion.wgsl")).unwrap();
+        let module = naga::front::wgsl::parse_str(&shader()).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -280,7 +290,8 @@ mod tests {
         let Some((device, queue)) = super::super::optical_flow::tests::device() else {
             return;
         };
-        let atlas = super::super::optical_flow::tests::upload(&device, &queue, [1, 1], &[0; 4]);
+        let source = (&[0u8; 4][..], 1, 1).into();
+        let atlas = SharedAtlas::new(&device, &queue, &source, None).unwrap();
         let mut motion = ObjectMotion::new(&device, atlas);
         let mut entities = quad(0.0, 0.0);
         entities.extend(quad(10.0, 0.5));

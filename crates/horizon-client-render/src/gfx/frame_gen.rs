@@ -179,7 +179,7 @@ impl FrameGen {
     pub fn track_entities(
         &mut self,
         device: &wgpu::Device,
-        atlas: &wgpu::TextureView,
+        atlas: &super::shared_atlas::SharedAtlas,
         entities: &[crate::mesher::Vertex],
         spans: &[(u32, u64)],
         camera: DVec3,

@@ -31,9 +31,12 @@ const CRUMBLING_BLEND: wgpu::BlendState = wgpu::BlendState {
 const TERRAIN_ATTRIBUTES: [wgpu::VertexAttribute; 5] =
     wgpu::vertex_attr_array![0=>Float32x3,1=>Uint16x2,2=>Uint16,4=>Uint8x2,3=>Unorm8x4];
 
-/// entity.wgsl after the OverlayTexture constants it reads.
+/// entity.wgsl after the OverlayTexture constants it reads, and the shared atlas's reads.
 fn entity_shader() -> String {
-    crate::overlay::wgsl_constants() + include_str!("hdr_light.wgsl") + include_str!("entity.wgsl")
+    crate::overlay::wgsl_constants()
+        + include_str!("hdr_light.wgsl")
+        + include_str!("entity.wgsl")
+        + shared_atlas::WGSL
 }
 
 fn no_pack_hdr_gain(layered: bool, pack: bool, world: bool) -> bool {
@@ -239,6 +242,7 @@ mod readback;
 mod resident;
 mod reuse;
 mod screenshot_save;
+pub mod shared_atlas;
 mod stars;
 mod surface_setup;
 use surface_setup::{AdapterChoice, AdapterFailure, open_adapter, pick_adapter, set_up_surface};
@@ -1110,6 +1114,71 @@ impl SolidPipeline {
     }
 }
 
+/// What the entity bind groups (`entity_group`, `hand_group`) hold besides their
+/// globals and the shared atlas: kept to make them again once the atlas's dynamic
+/// pool grew (`shared_atlas`).
+struct EntityResources {
+    layout: wgpu::BindGroupLayout,
+    atlas_sampler: wgpu::Sampler,
+    lightmap: (wgpu::TextureView, wgpu::Sampler),
+    glint: (wgpu::TextureView, wgpu::Sampler),
+    glint_armor: wgpu::TextureView,
+}
+
+impl EntityResources {
+    /// An entity bind group with `globals` and `atlas` as it is now.
+    fn group(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        globals: &wgpu::Buffer,
+        atlas: &shared_atlas::SharedAtlas,
+    ) -> wgpu::BindGroup {
+        let parts = atlas.parts();
+        let [dynamic, pages] = parts.entries();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(atlas.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.lightmap.0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.lightmap.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.glint.0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.glint.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&self.glint_armor),
+                },
+                dynamic,
+                pages,
+            ],
+        })
+    }
+}
+
 pub struct Renderer {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -1303,6 +1372,10 @@ pub struct Renderer {
     entity_group: wgpu::BindGroup,
     /// The layout of `entity_group`, for the native shadow pass.
     entity_bindings: wgpu::BindGroupLayout,
+    /// What `entity_group` and `hand_group` are made of, and the shared atlas's
+    /// generation they hold (`SharedAtlas::generation`).
+    entity_resources: EntityResources,
+    entity_atlas_generation: u64,
     /// The entity resources with the hand's projection (`hand_globals`).
     hand_group: wgpu::BindGroup,
     hand_globals: wgpu::Buffer,
@@ -1485,7 +1558,7 @@ pub struct Renderer {
     /// Frame generation (Horizon setting).
     frame_gen: frame_gen::FrameGen,
     /// The entities' texture atlas (`entity_group`'s), for frame generation's motion.
-    entity_atlas: wgpu::TextureView,
+    entity_atlas: shared_atlas::SharedAtlas,
     /// HDR output (Horizon setting): `Some` while the swapchain is HDR.
     hdr: Option<hdr::Hdr>,
     /// Which pixels of each block sprite may shine in HDR output (terrain.wgsl's
@@ -2865,7 +2938,10 @@ impl Renderer {
     }
 }
 impl Renderer {
-    pub async fn new(
+    /// `hud_atlas`: the shared atlas's pixels and size, with its bands
+    /// (`HudAtlas::bands`; pixels and size alone hold it all static), its pixels
+    /// read from `hud_atlas_file` when they were spilled there.
+    pub async fn new<'a>(
         window: Arc<Window>,
         offscreen: bool,
         sprite_pixels: &[u8],
@@ -2874,7 +2950,7 @@ impl Renderer {
         layers: u32,
         sprite_mips: &[crate::mipmap::Settings],
         animations: &[SpriteAnimation],
-        hud_atlas: (&[u8], u32, u32),
+        hud_atlas: impl Into<shared_atlas::Source<'a>>,
         hud_atlas_file: Option<&std::path::Path>,
         glint: (&[u8], u32, u32),
         glint_armor: (&[u8], u32, u32),
@@ -4019,7 +4095,8 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (atlas_pixels, atlas_width, atlas_height) = hud_atlas;
+        let atlas_source: shared_atlas::Source<'_> = hud_atlas.into();
+        let (atlas_width, atlas_height) = (atlas_source.width, atlas_source.height);
         log::info!(
             "Horizon: shared atlas {atlas_width}x{atlas_height}, {} MiB",
             u64::from(atlas_width) * u64::from(atlas_height) * 4 / (1024 * 1024)
@@ -4032,164 +4109,30 @@ impl Renderer {
             .into());
         }
         // The loading screen hands the game the same atlas pixels: reusing the
-        // previous texture skips the upload and, where the GPU's memory counts
-        // against the process (a 1 GB handheld's Mali), a second copy of it.
+        // previous textures skips the upload and, where the GPU's memory counts
+        // against the process (a 1 GB handheld's Mali), a second copy of them.
         let reused = previous
-            .and_then(|renderer| renderer.hud.atlas_texture.as_ref())
-            .filter(|texture| texture.width() == atlas_width && texture.height() == atlas_height);
-        // The baked ASTC copy of that spill, when `patch.bash` made one and
-        // this GPU samples it: a quarter of the bytes to read and to hold.
-        // Not the ASTC bake: the atlas takes run-time patches (font glyphs,
-        // skins, maps) as RGBA at arbitrary positions, and an ASTC texture can
-        // only be written in whole 4x4 blocks, which made the first patched
-        // frame fail with "Copy origin's x component is not a multiple of block
-        // width". Compressing it needs those mutable sprites in a texture of
-        // their own first; the bake stays beside the spill for that.
-        let baked: Option<wgpu::Texture> = None;
+            .map(|renderer| &renderer.hud.atlas)
+            .filter(|atlas| atlas.matches(&atlas_source));
+        // The atlas in bands (`shared_atlas`): the static ones in a texture of
+        // their own, the ones the game writes while it runs (font glyphs, skins,
+        // maps) held only once written. The caller may have spilled the CPU atlas
+        // to the game folder and dropped it, because 80 MiB of pixels held beside
+        // a world's tables is what a 1 GB console's killer acts on: it is then
+        // streamed back a band at a time.
         let atlas = match reused {
-            Some(texture) => {
+            Some(atlas) => {
                 log::info!(
                     "Horizon: shared atlas {atlas_width}x{atlas_height} reused from the previous renderer"
                 );
-                texture.clone()
+                atlas.clone()
             }
-            None if baked.is_some() => {
-                log::info!(
-                    "Horizon: shared atlas {atlas_width}x{atlas_height} loaded from its ASTC bake"
-                );
-                baked.expect("checked just above")
-            }
-            None if atlas_pixels.is_empty() => {
-                // The caller spilled the CPU atlas to the game folder and
-                // dropped it, because 80 MiB of pixels held beside a world's
-                // tables is what a 1 GB console's killer acts on. Stream it
-                // back a band at a time: the transient copy stays a few MiB.
-                let Some(path) = hud_atlas_file else {
-                    return Err(
-                        "the shared atlas has no CPU pixels left and no previous texture to reuse"
-                            .into(),
-                    );
-                };
-                use std::io::{Read as _, Seek as _, SeekFrom};
-                let atlas = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Shared atlas"),
-                    size: wgpu::Extent3d {
-                        width: atlas_width,
-                        height: atlas_height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
-                let started = std::time::Instant::now();
-                let bytes_per_row = atlas_width * 4;
-                let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
-                let mut buf = vec![0u8; (rows * bytes_per_row) as usize];
-                let mut file = std::fs::File::open(path).map_err(|e| {
-                    format!("the shared atlas at {}: {e}", path.display())
-                })?;
-                let mut y = 0;
-                while y < atlas_height {
-                    let height = rows.min(atlas_height - y);
-                    let len = (height * bytes_per_row) as usize;
-                    file.seek(SeekFrom::Start(u64::from(y) * u64::from(bytes_per_row)))
-                        .map_err(|e| e.to_string())?;
-                    file.read_exact(&mut buf[..len]).map_err(|e| e.to_string())?;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &atlas,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d { x: 0, y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &buf[..len],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bytes_per_row),
-                            rows_per_image: Some(height),
-                        },
-                        wgpu::Extent3d {
-                            width: atlas_width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                    queue.submit([]);
-                    y += height;
-                }
-                log::info!(
-                    "Horizon: shared atlas {atlas_width}x{atlas_height} streamed from {} in {} ms",
-                    path.display(),
-                    started.elapsed().as_millis()
-                );
-                atlas
-            }
-            None => {
-                let atlas = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Shared atlas"),
-                    size: wgpu::Extent3d {
-                        width: atlas_width,
-                        height: atlas_height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    // COPY_SRC: a shader pack's weather copies the rain and snow sprites out.
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
-                // `create_texture_with_data` stages the whole atlas (80 MiB on
-                // the default resources) in one buffer, which lands beside the
-                // packed CPU atlas at the peak of a 1 GB handheld. Upload in
-                // row chunks, flushing each staging buffer before the next, so
-                // the transient copy stays a few MiB.
-                let bytes_per_row = atlas_width * 4;
-                let rows = (4 * 1024 * 1024 / bytes_per_row).clamp(1, atlas_height);
-                let mut y = 0;
-                while y < atlas_height {
-                    let height = rows.min(atlas_height - y);
-                    let start = (y * bytes_per_row) as usize;
-                    let end = start + (height * bytes_per_row) as usize;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &atlas,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d { x: 0, y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &atlas_pixels[start..end],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bytes_per_row),
-                            rows_per_image: Some(height),
-                        },
-                        wgpu::Extent3d {
-                            width: atlas_width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                    queue.submit([]);
-                    y += height;
-                }
-                log::info!(
-                    "Horizon: shared atlas {atlas_width}x{atlas_height} uploaded, rss {} MiB",
-                    rss_mib_for_log()
-                );
-                atlas
-            }
+            None => shared_atlas::SharedAtlas::new(&device, &queue, &atlas_source, hud_atlas_file)?,
         };
-        let atlas_view = atlas.create_view(&Default::default());
+        log::info!(
+            "Horizon: shared atlas on the GPU, rss {} MiB",
+            rss_mib_for_log()
+        );
         // vanilla's `GlintSampler`: enchanted_glint_item as its own texture,
         // repeated per pixel (`clamp: false`), linear without mipmaps
         // (`blur: true`).
@@ -4245,16 +4188,15 @@ impl Renderer {
             glint_armor_pixels,
         );
         let glint_armor_view = glint_armor_texture.create_view(&Default::default());
-        let mut hud = HudRenderer::new(
+        let hud = HudRenderer::new(
             &device,
             overlay_format,
-            &atlas_view,
+            &atlas,
             &glint_view,
             &glint_armor_view,
             &glint_sampler,
             hud_coverage,
         )?;
-        hud.atlas_texture = Some(atlas.clone());
         let entity_step = crate::spans::startup::step("renderer.entity_pipelines");
         let entity_shader = kept.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon entities"),
@@ -4264,6 +4206,7 @@ impl Renderer {
             label: Some("Horizon static block entities"),
             source: wgpu::ShaderSource::Wgsl(static_entity_shader().into()),
         });
+        let atlas_parts = shared_atlas::layout_entries(vf);
         let entity_bindings = kept.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Entity bindings"),
             entries: &[
@@ -4327,6 +4270,9 @@ impl Renderer {
                         multisampled: false,
                     },
                 ),
+                // The shared atlas's other parts (binding 1 has its static bands).
+                atlas_parts[0],
+                atlas_parts[1],
             ],
         });
         let static_entity_bindings =
@@ -4348,44 +4294,14 @@ impl Renderer {
             label: Some("Atlas"),
             ..Default::default()
         });
-        let entity_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Entity resources"),
-            layout: &entity_bindings,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&lightmap_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&lightmap_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&glint_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&glint_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&glint_armor_view),
-                },
-            ],
-        });
+        let entity_resources = EntityResources {
+            layout: entity_bindings.clone(),
+            atlas_sampler: atlas_sampler.clone(),
+            lightmap: (lightmap_view.clone(), lightmap_sampler.clone()),
+            glint: (glint_view.clone(), glint_sampler.clone()),
+            glint_armor: glint_armor_view.clone(),
+        };
+        let entity_group = entity_resources.group(&device, "Entity resources", &globals, &atlas);
         let static_entity_transform =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Static block-entity camera position"),
@@ -4403,44 +4319,12 @@ impl Renderer {
                 resource: static_entity_transform.as_entire_binding(),
             }],
         });
-        let hand_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("First-person hand resources"),
-            layout: &entity_bindings,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: hand_globals.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&lightmap_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&lightmap_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&glint_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&glint_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&glint_armor_view),
-                },
-            ],
-        });
+        let hand_group = entity_resources.group(
+            &device,
+            "First-person hand resources",
+            &hand_globals,
+            &atlas,
+        );
         let entity_layout = kept.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Entity layout"),
             bind_group_layouts: &[Some(&entity_bindings)],
@@ -5175,7 +5059,9 @@ impl Renderer {
         });
         let screen_shader = kept.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon screen effects"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("screen.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                shared_atlas::with(include_str!("screen.wgsl")).into(),
+            ),
         });
         let screen_attributes =
             wgpu::vertex_attr_array![0=>Float32x2,1=>Float32x2,2=>Float32x4,3=>Float32x4];
@@ -5622,6 +5508,8 @@ impl Renderer {
             screen_capacity,
             entity_group,
             entity_bindings,
+            entity_resources,
+            entity_atlas_generation: atlas.generation(),
             static_entity_group,
             static_entity_transform,
             static_entity_camera: None,
@@ -5726,7 +5614,7 @@ impl Renderer {
             layout: crate::chunk::ColumnLayout::VANILLA,
             world_post,
             frame_gen: frame_gen::FrameGen::new(),
-            entity_atlas: atlas_view.clone(),
+            entity_atlas: atlas.clone(),
             hdr: None,
             hdr_lighting_setting: true,
             emission_stats,
@@ -5796,6 +5684,14 @@ impl Renderer {
             capture: None,
             capture_result: None,
         })
+    }
+    /// The shared atlas whole in one texture (`SharedAtlas::whole`), for what samples
+    /// it without the atlas's WGSL.
+    fn whole_atlas(&self) -> wgpu::Texture {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let whole = self.hud.atlas.whole(&self.device, &mut encoder);
+        self.queue.submit([encoder.finish()]);
+        whole
     }
     /// The first-person hand's quads, which follow `first` quads of the entity buffer.
     fn draw_hand(&self, pass: &mut wgpu::RenderPass<'_>, quads: u32, first: u32) {
@@ -7643,11 +7539,7 @@ impl Renderer {
                     .as_ref()
                     .map(|a| [a[0].view.clone(), a[1].view.clone()]),
                 lightmap: self.lightmap_view.clone(),
-                gui_size: self
-                    .hud
-                    .atlas_texture
-                    .as_ref()
-                    .map_or([1, 1], |t| [t.width(), t.height()]),
+                gui_size: self.hud.atlas.size().into(),
                 terrain: self.pack_atlas.as_ref().map(|_| pack_post::Geometry {
                     buffers: if flat { &buffers[..1] } else { &buffers },
                     table: self.flat.as_ref().filter(|_| flat).map(|f| &f.draw_layout),
@@ -7658,11 +7550,9 @@ impl Renderer {
                     cull: true,
                 }),
                 block_ids,
-                celestial: self
-                    .hud
-                    .atlas_texture
-                    .as_ref()
-                    .map(|t| t.create_view(&Default::default())),
+                // The pack's programs sample the shared atlas (sky, entities,
+                // particles, hand) as one texture: they get it whole.
+                celestial: Some(self.whole_atlas().create_view(&Default::default())),
                 clouds: Some(&self.cloud_bindings),
                 weather: true,
                 hand: true,
@@ -7781,16 +7671,9 @@ impl Renderer {
             .as_ref()
             .map(|a| [a[0].view.clone(), a[1].view.clone()]);
         let lightmap = self.lightmap_view.clone();
-        let gui_size = self
-            .hud
-            .atlas_texture
-            .as_ref()
-            .map_or([1, 1], |t| [t.width(), t.height()]);
-        let celestial = self
-            .hud
-            .atlas_texture
-            .as_ref()
-            .map(|t| t.create_view(&Default::default()));
+        let gui_size = self.hud.atlas.size().into();
+        // The pack's programs sample the shared atlas as one texture: they get it whole.
+        let celestial = Some(self.whole_atlas().create_view(&Default::default()));
         let flat = self.pack_terrain_flat;
         let table = (self.flat.as_ref())
             .filter(|_| flat)
@@ -10384,6 +10267,22 @@ impl Renderer {
             frame.hud,
             [self.config.width, self.config.height],
         );
+        // The frame's atlas writes are staged (the animated sprites before these):
+        // once they grew the atlas's dynamic pool, the entity groups are made again
+        // (the ones made before hold the pool it replaced).
+        let generation = self.hud.atlas.generation();
+        if generation != self.entity_atlas_generation {
+            let (resources, atlas) = (&self.entity_resources, &self.hud.atlas);
+            self.entity_group =
+                resources.group(&self.device, "Entity resources", &self.globals, atlas);
+            self.hand_group = resources.group(
+                &self.device,
+                "First-person hand resources",
+                &self.hand_globals,
+                atlas,
+            );
+            self.entity_atlas_generation = generation;
+        }
         if culling && let Some(cull) = &mut self.cull {
             cull.upload(
                 &self.device,
@@ -12070,8 +11969,12 @@ impl Renderer {
             && let Some((dimension, Some(mut post))) = self.pack_post.take()
         {
             let size = self.world_post.size().unwrap_or([1, 1]);
-            let weather = match &self.hud.atlas_texture {
-                Some(atlas) if pack_draws_weather => self
+            // The rain and snow sprites are copied out of the whole atlas (made
+            // when the pack was set).
+            let atlas =
+                pack_draws_weather.then(|| self.hud.atlas.whole(&self.device, &mut encoder));
+            let weather = match &atlas {
+                Some(atlas) => self
                     .pack_weather
                     .get_or_insert_with(|| pack_weather::PackWeather::new(&self.device))
                     .prepare(
@@ -12083,7 +11986,7 @@ impl Renderer {
                         frame.weather_time,
                         &self.indices,
                     ),
-                _ => None,
+                None => None,
             };
             post.set_weather(weather);
             let flat = self.flat.as_ref().filter(|_| flat_frame);
@@ -12261,6 +12164,10 @@ impl Renderer {
                 Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
                 None => (&self.depth, size),
             };
+            // A mod that may draw samples the shared atlas as one texture: it gets
+            // it whole (made the first time, kept up to date after).
+            let atlas = native_render::world_drawn_hooked()
+                .then(|| self.hud.atlas.whole(&self.device, &mut encoder));
             native_render::native_world_drawn(&mut native_render::WorldDrawn {
                 device: &self.device,
                 queue: &self.queue,
@@ -12277,7 +12184,7 @@ impl Renderer {
                 entities: frame.entities,
                 spans: frame.entity_spans,
                 motion: frame.entity_motion,
-                atlas: self.hud.atlas_texture.as_ref(),
+                atlas: atlas.as_ref(),
                 quad_indices: &self.indices,
                 block_sprites: native_render::BlockSpriteArrays {
                     views: &self.sprite_views,
@@ -12660,6 +12567,9 @@ impl Renderer {
         }
         // A native mod's turn after the hand, on the real frame only.
         if overlay.real && !frame.title {
+            // As `native_world_drawn`'s: the whole atlas for a mod that may draw.
+            let atlas = native_render::world_drawn_hooked()
+                .then(|| self.hud.atlas.whole(&self.device, encoder));
             native_render::native_hand_drawn(&mut native_render::HandDrawn {
                 device: &self.device,
                 queue: &self.queue,
@@ -12671,7 +12581,7 @@ impl Renderer {
                 hand: if overlay.hand_drawn { frame.hand } else { &[] },
                 view_proj: overlay.hand_view_proj,
                 camera: frame.camera,
-                atlas: self.hud.atlas_texture.as_ref(),
+                atlas: atlas.as_ref(),
                 quad_indices: &self.indices,
             });
         }
@@ -14448,7 +14358,11 @@ mod tests {
         for path in files {
             let text = std::fs::read_to_string(&path).unwrap();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name == "oit.wgsl" || name == "gpu_occlusion.wgsl" || name == "hdr_light.wgsl" {
+            if name == "oit.wgsl"
+                || name == "gpu_occlusion.wgsl"
+                || name == "hdr_light.wgsl"
+                || name == "shared_atlas.wgsl"
+            {
                 // The shared maths: it needs the file it is appended to. GPU culling's
                 // occlusion test is appended to gpu_culling.wgsl, on Vulkan alone.
                 continue;
@@ -14458,7 +14372,17 @@ mod tests {
                 || name == "custom_sky.wgsl"
             {
                 let base = include_str!("hdr_light.wgsl").to_owned() + &text;
-                sources.push((path, crate::overlay::wgsl_constants() + &base));
+                let mut source = crate::overlay::wgsl_constants() + &base;
+                if name == "entity.wgsl" {
+                    source += super::shared_atlas::WGSL;
+                }
+                sources.push((path, source));
+            } else if matches!(
+                name,
+                "hud.wgsl" | "screen.wgsl" | "motion.wgsl" | "world_primitives.wgsl"
+            ) {
+                // The shared atlas's other readers, with its reads appended.
+                sources.push((path, super::shared_atlas::with(&text)));
             } else if name == "hdr.wgsl" {
                 sources.push((path, super::hdr::shader()));
             } else if name == "oit_world.wgsl" {

@@ -11,9 +11,7 @@ impl super::HudRenderer {
     ) {
         let inputs = animator.mode_inputs();
         let inputs = Some(&inputs);
-        let Some(texture) = &self.atlas_texture else {
-            return;
-        };
+        let (width, height) = self.atlas.size();
         for (rect, animation, previous) in &mut self.sprite_animations {
             // `SpriteContents.AnimationState`: the frame from the mcmeta's
             // list, blended into the next one by the sub-frame's thousandths
@@ -23,7 +21,7 @@ impl super::HudRenderer {
             if state == *previous {
                 continue;
             }
-            let (w, h) = rect.texels((texture.width(), texture.height()));
+            let (w, h) = rect.texels((width, height));
             let pixels = if blend.millis == 0 {
                 animation.resized_pixels(blend.frame, w, h)
             } else {
@@ -39,18 +37,11 @@ impl super::HudRenderer {
                     })
                     .collect()
             };
-            uploads.texture(
+            self.atlas.write(
+                uploads,
                 encoder,
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: (rect.u0 * texture.width() as f32).round() as u32,
-                        y: (rect.v0 * texture.height() as f32).round() as u32,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
+                (rect.u0 * width as f32).round() as u32,
+                (rect.v0 * height as f32).round() as u32,
                 w,
                 h,
                 &pixels,

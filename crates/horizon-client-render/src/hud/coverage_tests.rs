@@ -106,10 +106,13 @@ impl Gpu {
             &[255, 255, 255, 255, 255, 255, 255, 0],
         );
         let view = atlas.create_view(&Default::default());
+        let source = (&[255, 255, 255, 255, 255, 255, 255, 0][..], 2, 1).into();
+        let shared =
+            crate::gfx::shared_atlas::SharedAtlas::new(&device, &queue, &source, None).unwrap();
         let hud = HudRenderer::new(
             &device,
             hud_coverage::HUD_FORMAT,
-            &view,
+            &shared,
             &view,
             &view,
             &device.create_sampler(&Default::default()),
@@ -397,7 +400,8 @@ fn coverage_uses_pack_texts_final_alpha_and_discard() {
         vertex: naga::front::wgsl::parse_str("@vertex fn main(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4(p.x / 2.0 - 1.0, 1.0 - p.y, 0.0, 1.0); }").unwrap(),
         fragment: naga::front::wgsl::parse_str("struct Result { @location(0) color: vec4<f32> } @fragment fn main(@builtin(position) p: vec4<f32>) -> Result { if p.x > 2.0 { discard; } return Result(vec4(0.4, 0.2, 0.1, 0.5)); }").unwrap(),
     };
-    gpu.hud.set_text_shader(&gpu.device, Some(&program));
+    gpu.hud
+        .set_text_shader(&gpu.device, &gpu.queue, Some(&program));
     assert!(gpu.hud.pack_text.is_some());
     let mut batch = HudBatch::new([4, 2]);
     for x in [0.0, 2.0, 0.0, 2.0] {
@@ -418,6 +422,7 @@ fn a_pack_text_shader_without_a_colour_output_is_dropped_not_wrapped() {
         vertex: naga::front::wgsl::parse_str("@vertex fn main(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4(p, 0.0, 1.0); }").unwrap(),
         fragment: naga::front::wgsl::parse_str("@fragment fn main() -> @location(1) vec4<f32> { return vec4(1.0); }").unwrap(),
     };
-    gpu.hud.set_text_shader(&gpu.device, Some(&program));
+    gpu.hud
+        .set_text_shader(&gpu.device, &gpu.queue, Some(&program));
     assert!(gpu.hud.pack_text.is_none());
 }

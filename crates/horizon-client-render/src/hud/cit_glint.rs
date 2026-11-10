@@ -370,7 +370,7 @@ impl CitGlintPass {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon HUD (CIT glints)"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../hud.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(super::shader_source().into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("CIT glint layout"),
@@ -412,7 +412,7 @@ impl CitGlintPass {
                     multiview_mask: None,
                     cache: None,
                 };
-                let source = wgpu::ShaderSource::Wgsl(include_str!("../hud.wgsl").into());
+                let source = wgpu::ShaderSource::Wgsl(super::shader_source().into());
                 Pipeline::new(device, &desc, source, coverage).expect("the CIT glint's coverage")
             })
             .collect();

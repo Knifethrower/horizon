@@ -116,7 +116,32 @@ fn composed() -> Vec<(&'static str, Vec<&'static str>, String)> {
             vec!["custom_sky.wgsl"],
             include_str!("../hdr_light.wgsl").to_owned() + include_str!("custom_sky.wgsl"),
         ),
-        ("entity", vec!["entity.wgsl"], entity.clone()),
+        (
+            "entity",
+            vec!["entity.wgsl", "shared_atlas.wgsl"],
+            entity.clone(),
+        ),
+        // The shared atlas's other readers, with its reads appended (gfx/shared_atlas.rs).
+        (
+            "HUD",
+            vec!["hud.wgsl", "shared_atlas.wgsl"],
+            crate::hud::shader_source(),
+        ),
+        (
+            "screen effects",
+            vec!["screen.wgsl", "shared_atlas.wgsl"],
+            super::shared_atlas::with(include_str!("../screen.wgsl")),
+        ),
+        (
+            "frame generation motion",
+            vec!["motion.wgsl", "shared_atlas.wgsl"],
+            super::shared_atlas::with(include_str!("frame_gen/motion.wgsl")),
+        ),
+        (
+            "world primitives",
+            vec!["world_primitives.wgsl", "shared_atlas.wgsl"],
+            super::shared_atlas::with(include_str!("world_primitives.wgsl")),
+        ),
         (
             "GPU culling occlusion test",
             vec!["gpu_culling.wgsl", "gpu_occlusion.wgsl"],

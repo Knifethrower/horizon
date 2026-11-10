@@ -214,8 +214,8 @@ struct HorizonWeatherOut {
 }
 @fragment fn horizon_weather_fs(in: HorizonWeatherOut) -> @location(0) vec4<f32> {
     let texel = horizon_entity_weather_texel(in.uv, in.rect,
-        textureDimensions(horizon_entity_atlas));
-    let color = textureLoad(horizon_entity_atlas, texel, 0) * in.color;
+        horizon_entity_atlas_size());
+    let color = horizon_entity_atlas_load(texel) * in.color;
     if color.a < 0.1 { discard; }
     let input = WeatherInput(vec4(horizon_line_in(color.rgb), color.a), in.light, in.position,
         in.snow != 0u);

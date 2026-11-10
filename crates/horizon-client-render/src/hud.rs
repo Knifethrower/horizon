@@ -78,6 +78,10 @@ pub struct HudAtlas {
     pub galactic_widths: [u16; 128],
     pub width: u32,
     pub height: u32,
+    /// Which bands of rows the game writes while it runs (the run-time slots,
+    /// the animated sprites, the glyph rows) and which of those have pixels:
+    /// the GPU holds those only once written (`gfx::shared_atlas`).
+    pub bands: crate::gfx::shared_atlas::Bands,
     pub sprites: HashMap<String, Rect>,
     /// Resolved player-profile names and UUIDs for inline head components.
     pub object_skins: HashMap<String, String>,
@@ -814,6 +818,16 @@ impl HudAtlas {
                 .unwrap_or_else(|| vec![0; size]),
         )
     }
+    /// What a renderer makes the atlas's textures from (`Renderer::new`): `pixels`
+    /// (`Self::pixels`, empty once spilled to a file) with this atlas's size and bands.
+    pub fn source<'a>(&'a self, pixels: &'a [u8]) -> crate::gfx::shared_atlas::Source<'a> {
+        crate::gfx::shared_atlas::Source {
+            pixels,
+            width: self.width,
+            height: self.height,
+            bands: std::borrow::Cow::Borrowed(&self.bands),
+        }
+    }
     /// Keep the pixels compressed from now on, once a renderer has them: the
     /// window's GPU holds the atlas, and a copy as built only serves a
     /// renderer made again (another window, a lost device, another graphics
@@ -969,6 +983,7 @@ impl HudAtlas {
             galactic_widths: [0; 128],
             width: 1,
             height: 1,
+            bands: crate::gfx::shared_atlas::Bands::all_static(1, 1),
             sprites: HashMap::new(),
             object_skins: HashMap::new(),
             object_skins_revision: Self::next_revision(),
@@ -1021,6 +1036,8 @@ impl HudAtlas {
             rect(0, 0, width, text_rows, width, text_rows),
         );
         let white = sprites["horizon/white"];
+        // The theme's text and the glyph rows are written while the boot screen runs.
+        let written = [(0, text_rows), (glyph_top, height)];
         Self {
             pictures: Default::default(),
             revision: Self::next_revision(),
@@ -1034,6 +1051,7 @@ impl HudAtlas {
             ),
             material_maps: Default::default(),
             galactic_widths: galactic_widths(&sprites, &pixels, width, height),
+            bands: crate::gfx::shared_atlas::Bands::new(width, height, &written, &pixels),
             pixels,
             packed: None,
             width,
@@ -1426,13 +1444,18 @@ impl HudAtlas {
                 images.push(image);
             }
         }
+        // What the game writes while it runs: the slots, and the animated sprites
+        // (their frames turn). The GPU holds their bands apart (`HudAtlas::bands`).
+        let mut written: HashSet<String> = HashSet::new();
         if full {
             // Official Recipes artwork from Just Enough Items, under MIT.
             for (name, png) in crate::jei_sprites::SPRITES {
                 let (width, height, rgba) = decode_bytes(png)?;
                 images.push((format!("horizon/jei/{name}"), width, height, rgba));
             }
+            let slots_from = images.len();
             Self::slots(&mut images, crate::trims::slot_size(root), mod_image);
+            written.extend(images[slots_from..].iter().map(|image| image.0.clone()));
             // MissingTextureAtlasSprite.generateMissingImage: 16x16, magenta
             // and black quarters.
             let missing = (0..256)
@@ -1461,13 +1484,19 @@ impl HudAtlas {
         images.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
         let (width, placements, glyph_region) =
             Self::layout_leaving_out(&mut images, &mut animated, &cit_names, MAX_ATLAS_SIZE)?;
+        written.extend(animated.iter().cloned());
         // A multiple of 1024 rather than a power of two: the default resources
         // need 4096x5120 (8192 rows before), Faithful 32x 4096x12288 (16384).
         let height = (glyph_region + GLYPH_ROWS).next_multiple_of(1024);
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut sprites = HashMap::new();
         let mut translucent = HashSet::new();
+        // The rows written while the game runs: the glyph rows, and the images above.
+        let mut written_rows = vec![(glyph_region, height)];
         for ((name, w, h, data), (px, py)) in images.drain(..).zip(placements) {
+            if written.contains(&name) {
+                written_rows.push((py, py + h));
+            }
             if data
                 .as_chunks::<4>()
                 .0
@@ -1540,6 +1569,7 @@ impl HudAtlas {
             }
             sprite_animations.push((rect, animation));
         }
+        let bands = crate::gfx::shared_atlas::Bands::new(width, height, &written_rows, &pixels);
         // Each mapped texture's maps at its size in the atlas, paged.
         let material_maps = if maps.is_empty() {
             Default::default()
@@ -1583,6 +1613,7 @@ impl HudAtlas {
             packed: None,
             width,
             height,
+            bands,
             sprites,
             object_skins: HashMap::new(),
             object_skins_revision: Self::next_revision(),
@@ -2549,11 +2580,23 @@ impl HudUniform {
 }
 use crate::gfx::hud_coverage::{self, Pipeline};
 
+/// hud.wgsl, with the shared atlas's reads.
+pub(crate) fn shader_source() -> String {
+    crate::gfx::shared_atlas::with(include_str!("hud.wgsl"))
+}
+
 pub struct HudRenderer {
     pictures: HashMap<u64, (Arc<pictures::Picture>, wgpu::BindGroup)>,
     pub sprite_animations: Vec<(Rect, crate::sprites::SpriteAnimation, (usize, usize, u32))>,
-    /// The shared atlas texture, for run-time glyph uploads.
-    pub atlas_texture: Option<wgpu::Texture>,
+    /// The shared atlas on the GPU, for run-time writes (glyphs, slots, animated sprites).
+    pub atlas: crate::gfx::shared_atlas::SharedAtlas,
+    /// What a picture's bind group binds beside its texture (`hud/pictures.rs`).
+    whole_parts: crate::gfx::shared_atlas::Parts,
+    /// What `group` is made of besides its uniform and the atlas (`group_for`), and
+    /// the atlas's generation it holds (`follow_atlas`).
+    samplers: [wgpu::Sampler; 3],
+    glint_views: [wgpu::TextureView; 2],
+    group_generation: u64,
     pipeline: Pipeline,
     /// `RenderPipelines.CROSSHAIR`.
     invert_pipeline: Pipeline,
@@ -2573,7 +2616,6 @@ pub struct HudRenderer {
     capacity: u64,
     format: wgpu::TextureFormat,
     coverage: bool,
-    atlas_view: wgpu::TextureView,
     /// The resource pack's text shader, when it has one that works.
     pack_text: Option<pack_text::PackText>,
     /// Target pixels per window pixel: above 1 for a screenshot drawn larger than the
@@ -2581,10 +2623,11 @@ pub struct HudRenderer {
     pub zoom: f32,
 }
 impl HudRenderer {
+    /// `atlas`: the shared atlas on the GPU (`gfx::shared_atlas`).
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        view: &wgpu::TextureView,
+        atlas: &crate::gfx::shared_atlas::SharedAtlas,
         glint_view: &wgpu::TextureView,
         glint_armor_view: &wgpu::TextureView,
         glint_sampler: &wgpu::Sampler,
@@ -2592,8 +2635,9 @@ impl HudRenderer {
     ) -> Result<Self> {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon HUD"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("hud.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source().into()),
         });
+        let atlas_parts = crate::gfx::shared_atlas::layout_entries(wgpu::ShaderStages::FRAGMENT);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("HUD"),
@@ -2671,42 +2715,14 @@ impl HudRenderer {
                     },
                     count: None,
                 },
+                // The shared atlas's other parts (binding 1 has its static bands).
+                atlas_parts[0],
+                atlas_parts[1],
             ],
         });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("HUD resources"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(glint_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(glint_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&linear_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(glint_armor_view),
-                },
-            ],
-        });
+        let samplers = [sampler, glint_sampler.clone(), linear_sampler];
+        let glint_views = [glint_view.clone(), glint_armor_view.clone()];
+        let group = Self::group_for(device, &layout, &uniform, atlas, &samplers, &glint_views);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("HUD layout"),
             bind_group_layouts: &[Some(&layout)],
@@ -2751,7 +2767,7 @@ impl HudRenderer {
                 multiview_mask: None,
                 cache: None,
             };
-            let source = wgpu::ShaderSource::Wgsl(include_str!("hud.wgsl").into());
+            let source = wgpu::ShaderSource::Wgsl(shader_source().into());
             Pipeline::new(device, &desc, source, coverage).expect("the HUD's coverage")
         };
         let pipeline = create("HUD", wgpu::BlendState::ALPHA_BLENDING, "fs_main", None);
@@ -2840,7 +2856,11 @@ impl HudRenderer {
         });
         Ok(Self {
             pictures: HashMap::new(),
-            atlas_texture: None,
+            atlas: atlas.clone(),
+            whole_parts: crate::gfx::shared_atlas::Parts::whole(device),
+            samplers,
+            glint_views,
+            group_generation: atlas.generation(),
             sprite_animations: Vec::new(),
             pipeline,
             invert_pipeline,
@@ -2857,9 +2877,59 @@ impl HudRenderer {
             capacity,
             format,
             coverage,
-            atlas_view: view.clone(),
             pack_text: None,
             zoom: 1.0,
+        })
+    }
+    /// The HUD's bind group with `atlas` as it is now: its static bands at binding 1, the
+    /// other parts beside them; then the HUD sampler, the glint and its sampler, the linear
+    /// sampler and the armour glint (`samplers`: HUD, glint, linear; `glint_views`: item,
+    /// armour).
+    fn group_for(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        uniform: &wgpu::Buffer,
+        atlas: &crate::gfx::shared_atlas::SharedAtlas,
+        samplers: &[wgpu::Sampler; 3],
+        glint_views: &[wgpu::TextureView; 2],
+    ) -> wgpu::BindGroup {
+        let parts = atlas.parts();
+        let [dynamic, pages] = parts.entries();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("HUD resources"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(atlas.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&samplers[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&glint_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&samplers[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&samplers[2]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&glint_views[1]),
+                },
+                dynamic,
+                pages,
+            ],
         })
     }
     /// Draw the CIT glint layers of `textures` (the pack's enchantment rules); `None` or no
@@ -2875,46 +2945,49 @@ impl HudRenderer {
         });
     }
     /// Draw the GUI's text with `shader` (`HudAtlas::text_shader`), or natively.
+    /// The pack's shader samples the shared atlas as one texture: it gets the
+    /// whole atlas (`SharedAtlas::whole`).
     pub fn set_text_shader(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         shader: Option<&crate::core_shader::CoreProgram>,
     ) {
         self.pack_text = shader.and_then(|shader| {
-            pack_text::PackText::new(device, self.format, &self.atlas_view, shader, self.coverage)
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let whole = self.atlas.whole(device, &mut encoder);
+            queue.submit([encoder.finish()]);
+            let view = whole.create_view(&Default::default());
+            pack_text::PackText::new(device, self.format, &view, shader, self.coverage)
         });
     }
-    /// Stage `patches` into the shared atlas texture.
+    /// Stage `patches` into the shared atlas.
     pub fn upload_patches(
         &self,
         uploads: &mut crate::gfx::upload::Uploads,
         encoder: &mut wgpu::CommandEncoder,
         patches: &[crate::font::Patch],
     ) {
-        if let Some(texture) = &self.atlas_texture {
-            for p in patches {
-                if p.x.saturating_add(p.width) <= texture.width()
-                    && p.y.saturating_add(p.height) <= texture.height()
-                {
-                    uploads.texture(
-                        encoder,
-                        wgpu::TexelCopyTextureInfo {
-                            texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                x: p.x,
-                                y: p.y,
-                                z: 0,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        p.width,
-                        p.height,
-                        &p.rgba,
-                    );
-                }
-            }
+        for p in patches {
+            self.atlas
+                .write(uploads, encoder, p.x, p.y, p.width, p.height, &p.rgba);
         }
+    }
+    /// Make the HUD's bind group again once the shared atlas's dynamic pool grew:
+    /// the one made before holds the pool it replaced.
+    fn follow_atlas(&mut self, device: &wgpu::Device) {
+        if self.atlas.generation() == self.group_generation {
+            return;
+        }
+        self.group = Self::group_for(
+            device,
+            &self.layout,
+            &self.uniform,
+            &self.atlas,
+            &self.samplers,
+            &self.glint_views,
+        );
+        self.group_generation = self.atlas.generation();
     }
     /// Stage the batch's atlas patches, vertices and uniform: before the
     /// frame's first pass, so the copies share one command buffer.
@@ -2928,6 +3001,9 @@ impl HudRenderer {
     ) {
         self.prepare_pictures(device, uploads, encoder, batch);
         self.upload_patches(uploads, encoder, &batch.patches);
+        // The frame's writes are staged (the animated sprites before these):
+        // the group gets the dynamic pool they may have grown.
+        self.follow_atlas(device);
         if batch.vertices.is_empty() || size.contains(&0) {
             return;
         }
@@ -3109,6 +3185,9 @@ impl HudRenderer {
     }
 }
 
+#[cfg(test)]
+#[path = "hud/atlas_tests.rs"]
+mod atlas_tests;
 #[cfg(test)]
 #[path = "hud/coverage_tests.rs"]
 mod coverage_tests;
@@ -4657,7 +4736,7 @@ texture=wide",
 
     #[test]
     fn hud_shader_validates_both_fragment_entries() {
-        let module = naga::front::wgsl::parse_str(include_str!("hud.wgsl")).unwrap();
+        let module = naga::front::wgsl::parse_str(&shader_source()).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
