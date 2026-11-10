@@ -374,6 +374,105 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 /// A packed atlas image: sprite name, size and RGBA pixels.
 type PackedImage = (String, u32, u32, Vec<u8>);
+/// Bottom-left skyline packing of `images` (tallest first) `width` texels wide from row `top`:
+/// each at the lowest place it fits, then the leftmost, with a texel of gap to its right and
+/// below it. Shelves leave the room above every shorter image of a shelf empty; on the
+/// default resources, with the images written at run time apart, they took 6144 rows for
+/// what this packs in 5120. Returns the placements and the first row below them all; an image
+/// too wide for `width` goes at the left edge below the rest (the caller widens the atlas).
+fn skyline(images: &[PackedImage], width: u32, top: u32) -> (Vec<(u32, u32)>, u32) {
+    // The skyline's segments, left to right across the whole width: where each starts, the
+    // first free row above it and how wide it is.
+    let mut line: Vec<(u32, u32, u32)> = vec![(0, top, width)];
+    let mut placements = Vec::with_capacity(images.len());
+    let mut bottom = top;
+    for (_, w, h, _) in images {
+        let (w, h) = (w + 1, h + 1);
+        // The lowest spot at the start of a segment, the image's width wide.
+        let mut best: Option<(u32, u32)> = None;
+        for (i, &(x, _, _)) in line.iter().enumerate() {
+            if x + w > width {
+                break;
+            }
+            let (mut y, mut covered) = (0, 0);
+            for &(_, sy, sw) in &line[i..] {
+                if covered >= w {
+                    break;
+                }
+                y = y.max(sy);
+                covered += sw;
+            }
+            if best.is_none_or(|(by, _)| y < by) {
+                best = Some((y, x));
+            }
+        }
+        let (y, x) = best.unwrap_or((bottom, 0));
+        placements.push((x, y));
+        bottom = bottom.max(y + h);
+        // The image's top edge replaces the skyline under it.
+        let end = x + w;
+        let mut next = Vec::with_capacity(line.len() + 2);
+        for &(sx, sy, sw) in &line {
+            if sx + sw <= x || sx >= end {
+                next.push((sx, sy, sw));
+                continue;
+            }
+            if sx < x {
+                next.push((sx, sy, x - sx));
+            }
+            if sx + sw > end {
+                next.push((end, sy, sx + sw - end));
+            }
+        }
+        next.push((x, y + h, w.min(width - x)));
+        next.sort_unstable_by_key(|segment| segment.0);
+        line.clear();
+        for segment in next {
+            match line.last_mut() {
+                Some(last) if last.1 == segment.1 && last.0 + last.2 == segment.0 => {
+                    last.2 += segment.2;
+                }
+                _ => line.push(segment),
+            }
+        }
+    }
+    (placements, bottom)
+}
+/// How [`HudAtlas::layout`] packs a width: a skyline, else the shelves (each image after
+/// the last), else each image in the first shelf with room.
+#[derive(Clone, Copy)]
+enum Packer {
+    Skyline,
+    Shelves,
+    FirstFit,
+}
+impl Packer {
+    /// `images` packed `width` texels wide from row `top`: their placements and the first
+    /// row below them.
+    fn place(self, images: &[PackedImage], width: u32, top: u32) -> (Vec<(u32, u32)>, u32) {
+        match self {
+            Self::Skyline => skyline(images, width, top),
+            _ if images.is_empty() => (Vec::new(), top),
+            Self::Shelves | Self::FirstFit => {
+                let first_fit = matches!(self, Self::FirstFit);
+                let (placements, end) = HudAtlas::shelves(images, width, first_fit);
+                let placements = placements.into_iter().map(|(x, y)| (x, y + top));
+                (placements.collect(), top + end)
+            }
+        }
+    }
+}
+/// Where [`HudAtlas::layout`] puts the images.
+#[derive(Debug)]
+struct Layout {
+    width: u32,
+    /// The images packed once, from the top.
+    fixed: Vec<(u32, u32)>,
+    /// The images written while the game runs, from the first band row past the fixed ones.
+    written: Vec<(u32, u32)>,
+    /// The first row free for glyphs.
+    glyph_region: u32,
+}
 /// A frame of an animated strip at `x, y`, nearest-resampled to the longer
 /// side of the frame: array layers are square, as `Sprites::load` keeps them
 /// for the world's sprite arrays.
@@ -1078,49 +1177,62 @@ impl HudAtlas {
     /// `layout`, but when `extras` (Custom Item Textures) make the images more than `max`
     /// holds, without them: they are left out, not the packs.
     fn layout_leaving_out(
-        images: &mut Vec<PackedImage>,
+        fixed: &mut Vec<PackedImage>,
+        written: &mut Vec<PackedImage>,
         animated: &mut Vec<String>,
         extras: &HashSet<String>,
         max: u32,
-    ) -> Result<(u32, Vec<(u32, u32)>, u32)> {
-        match Self::layout(images, max) {
+    ) -> Result<Layout> {
+        match Self::layout(fixed, written, max) {
             Err(e) if !extras.is_empty() => {
-                images.retain(|i| !extras.contains(&i.0));
+                fixed.retain(|i| !extras.contains(&i.0));
+                written.retain(|i| !extras.contains(&i.0));
                 animated.retain(|n| !extras.contains(n));
-                let layout = Self::layout(images, max)?;
+                let layout = Self::layout(fixed, written, max)?;
                 log::warn!("left out the custom item textures: {e}");
                 Ok(layout)
             }
             layout => layout,
         }
     }
-    /// Shelf placements of `images` (tallest first) in the narrowest atlas
-    /// width from 4096 up that keeps the atlas, glyph rows included, within
-    /// `max` texels a side; and the first row free for glyphs. High-resolution
-    /// packs fill a 4096-wide atlas past what GPUs allow (Faithful 64x needs
-    /// 32768 rows); vanilla's stitcher fails the reload when its atlases don't
-    /// fit, and the packs are then turned off (`Minecraft.clearResourcePacksOnError`).
-    /// A width where the plain shelves (each image after the last) leave too
-    /// much unused is tried again with each image in the first shelf with
-    /// room: a pack of thousands of mixed sizes (server packs with custom
-    /// items) fits where the shelves' ragged ends would not.
-    fn layout(images: &[PackedImage], max: u32) -> Result<(u32, Vec<(u32, u32)>, u32)> {
+    /// Placements of the images (each list tallest first) in the narrowest atlas width from
+    /// 4096 up that keeps the atlas, glyph rows included, within `max` texels a side. `fixed`,
+    /// packed once, go from the top; `written`, which the game writes while it runs (the
+    /// run-time slots, the animated sprites), from the first band row below them
+    /// (`gfx::shared_atlas::BAND_ROWS`), so that the GPU holds the bands of each apart; the
+    /// rows free for glyphs follow. High-resolution packs fill a 4096-wide atlas past what
+    /// GPUs allow (Faithful 64x needs 32768 rows); vanilla's stitcher fails the reload when
+    /// its atlases don't fit, and the packs are then turned off
+    /// (`Minecraft.clearResourcePacksOnError`).
+    /// Each width is packed with a skyline (`skyline`); where that does not fit, with the
+    /// plain shelves (each image after the last), then with each image in the first shelf
+    /// with room: a pack of thousands of mixed sizes (server packs with custom items) fits
+    /// where the shelves' ragged ends would not.
+    fn layout(fixed: &[PackedImage], written: &[PackedImage], max: u32) -> Result<Layout> {
         let mut width = 4096.min(max);
         loop {
-            let wide_enough = images.iter().all(|i| i.1 < width);
+            let wide_enough = fixed.iter().chain(written).all(|i| i.1 < width);
             if wide_enough {
-                for first_fit in [false, true] {
-                    let (placements, glyph_region) = Self::shelves(images, width, first_fit);
+                for packer in [Packer::Skyline, Packer::Shelves, Packer::FirstFit] {
+                    let (fixed_at, fixed_end) = packer.place(fixed, width, 0);
+                    let top = fixed_end.next_multiple_of(crate::gfx::shared_atlas::BAND_ROWS);
+                    let (written_at, glyph_region) = packer.place(written, width, top);
                     if glyph_region + GLYPH_ROWS <= max {
-                        return Ok((width, placements, glyph_region));
+                        return Ok(Layout {
+                            width,
+                            fixed: fixed_at,
+                            written: written_at,
+                            glyph_region,
+                        });
                     }
                 }
             }
             if width >= max {
-                let texels: u64 = images.iter().map(|i| u64::from(i.1) * u64::from(i.2)).sum();
+                let images = fixed.iter().chain(written);
+                let texels: u64 = images.map(|i| u64::from(i.1) * u64::from(i.2)).sum();
                 return Err(format!(
                     "the textures ({} images, {texels} texels) do not fit a {max}x{max} atlas",
-                    images.len()
+                    fixed.len() + written.len()
                 )
                 .into());
             }
@@ -1445,7 +1557,8 @@ impl HudAtlas {
             }
         }
         // What the game writes while it runs: the slots, and the animated sprites
-        // (their frames turn). The GPU holds their bands apart (`HudAtlas::bands`).
+        // (their frames turn). They are packed below the rest, so the GPU holds whole
+        // bands of each (`HudAtlas::bands`).
         let mut written: HashSet<String> = HashSet::new();
         if full {
             // Official Recipes artwork from Just Enough Items, under MIT.
@@ -1482,18 +1595,36 @@ impl HudAtlas {
             images.push(("horizon/recipes/settings".to_owned(), width, height, rgba));
         }
         images.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
-        let (width, placements, glyph_region) =
-            Self::layout_leaving_out(&mut images, &mut animated, &cit_names, MAX_ATLAS_SIZE)?;
         written.extend(animated.iter().cloned());
+        let (mut written_images, mut images): (Vec<PackedImage>, Vec<PackedImage>) = images
+            .into_iter()
+            .partition(|image| written.contains(&image.0));
+        let Layout {
+            width,
+            fixed: fixed_at,
+            written: written_at,
+            glyph_region,
+        } = Self::layout_leaving_out(
+            &mut images,
+            &mut written_images,
+            &mut animated,
+            &cit_names,
+            MAX_ATLAS_SIZE,
+        )?;
         // A multiple of 1024 rather than a power of two: the default resources
-        // need 4096x5120 (8192 rows before), Faithful 32x 4096x12288 (16384).
+        // need 4096x5120 (8192 rows with power-of-two heights, 6144 with shelves),
+        // Faithful 32x 4096x12288 (16384).
         let height = (glyph_region + GLYPH_ROWS).next_multiple_of(1024);
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut sprites = HashMap::new();
         let mut translucent = HashSet::new();
         // The rows written while the game runs: the glyph rows, and the images above.
         let mut written_rows = vec![(glyph_region, height)];
-        for ((name, w, h, data), (px, py)) in images.drain(..).zip(placements) {
+        let placed = images
+            .drain(..)
+            .zip(fixed_at)
+            .chain(written_images.drain(..).zip(written_at));
+        for ((name, w, h, data), (px, py)) in placed {
             if written.contains(&name) {
                 written_rows.push((py, py + h));
             }
@@ -1534,6 +1665,7 @@ impl HudAtlas {
         // The stitched atlas holds everything the images did; the decoded
         // copies are 80 MiB of a handheld's RAM and nothing reads them again.
         drop(images);
+        drop(written_images);
         // Every animated sprite animates: the packed strip is the raw first
         // frame, while the mcmeta's frame list may start anywhere, so each
         // animation's frame(0) overwrites its atlas rect before drawing.
@@ -4085,18 +4217,25 @@ texture=wide",
             let pixels = vec![0; (side * side * 4) as usize];
             (name.to_owned(), side, side, pixels)
         };
-        let mut images = vec![image("item/stick", 16), image("horizon_cit:big", 1100)];
+        // The big one is animated: packed with what is written at run time.
+        let mut images = vec![image("item/stick", 16)];
+        let mut written = vec![image("horizon_cit:big", 1100)];
         let mut animated = vec!["horizon_cit:big".to_owned()];
         let extras = HashSet::from(["horizon_cit:big".to_owned()]);
-        assert!(HudAtlas::layout(&images, 1024).is_err());
-        HudAtlas::layout_leaving_out(&mut images, &mut animated, &extras, 1024).unwrap();
+        assert!(HudAtlas::layout(&images, &written, 1024).is_err());
+        HudAtlas::layout_leaving_out(&mut images, &mut written, &mut animated, &extras, 1024)
+            .unwrap();
         let names: Vec<_> = images.iter().map(|i| i.0.as_str()).collect();
         assert_eq!(names, ["item/stick"]);
-        assert!(animated.is_empty());
+        assert!(written.is_empty() && animated.is_empty());
         // Without extras to leave out, it fails as before.
         let mut alone = vec![image("item/big", 1100)];
         let none = HashSet::new();
-        assert!(HudAtlas::layout_leaving_out(&mut alone, &mut animated, &none, 1024).is_err());
+        let mut nothing = Vec::new();
+        assert!(
+            HudAtlas::layout_leaving_out(&mut alone, &mut nothing, &mut animated, &none, 1024)
+                .is_err()
+        );
     }
     #[test]
     fn a_root_without_cit_rules_packs_the_same_sprites() {
@@ -4230,19 +4369,19 @@ texture=wide",
     #[test]
     fn the_default_textures_keep_a_4096_wide_atlas() {
         let images = sized(400, 64, 64);
-        let (width, placements, free) = HudAtlas::layout(&images, MAX_ATLAS_SIZE).unwrap();
-        assert_eq!(width, 4096);
-        assert_inside(&images, width, &placements, free);
+        let layout = HudAtlas::layout(&images, &[], MAX_ATLAS_SIZE).unwrap();
+        assert_eq!(layout.width, 4096);
+        assert_inside(&images, layout.width, &layout.fixed, layout.glyph_region);
     }
     #[test]
     fn a_high_resolution_pack_widens_the_atlas_to_fit_the_gpu() {
         // 34 rows of three 1024x512 GUI textures: 17442 rows at 4096 wide,
         // past the 16384 GPUs allow (Faithful 64x needed 32768).
         let images = sized(100, 1024, 512);
-        let (width, placements, free) = HudAtlas::layout(&images, MAX_ATLAS_SIZE).unwrap();
-        assert_eq!(width, 8192);
-        assert!(free + GLYPH_ROWS <= MAX_ATLAS_SIZE);
-        assert_inside(&images, width, &placements, free);
+        let layout = HudAtlas::layout(&images, &[], MAX_ATLAS_SIZE).unwrap();
+        assert_eq!(layout.width, 8192);
+        assert!(layout.glyph_region + GLYPH_ROWS <= MAX_ATLAS_SIZE);
+        assert_inside(&images, layout.width, &layout.fixed, layout.glyph_region);
     }
     #[test]
     fn mixed_sizes_fill_the_ends_of_the_shelves() {
@@ -4252,17 +4391,85 @@ texture=wide",
         // Each in a gap, it is 15.
         let mut images = sized(15, 9000, 1000);
         images.extend(sized(15, 4000, 1000));
-        let (width, placements, free) = HudAtlas::layout(&images, 16384).unwrap();
-        assert_eq!(width, 16384);
-        assert!(free + GLYPH_ROWS <= 16384);
-        assert_inside(&images, width, &placements, free);
+        let layout = HudAtlas::layout(&images, &[], 16384).unwrap();
+        assert_eq!(layout.width, 16384);
+        assert!(layout.glyph_region + GLYPH_ROWS <= 16384);
+        assert_inside(&images, layout.width, &layout.fixed, layout.glyph_region);
     }
     #[test]
     fn textures_that_cannot_fit_are_an_error_not_a_gpu_panic() {
-        let error = HudAtlas::layout(&sized(300, 1024, 1024), MAX_ATLAS_SIZE).unwrap_err();
+        let error = HudAtlas::layout(&sized(300, 1024, 1024), &[], MAX_ATLAS_SIZE).unwrap_err();
         assert!(error.to_string().contains("do not fit a 16384x16384 atlas"));
-        // One image wider than the largest atlas.
-        assert!(HudAtlas::layout(&sized(1, 2048, 16), 2048).is_err());
+        // One image wider than the largest atlas, packed once or written at run time.
+        assert!(HudAtlas::layout(&sized(1, 2048, 16), &[], 2048).is_err());
+        assert!(HudAtlas::layout(&sized(1, 16, 16), &sized(1, 2048, 16), 2048).is_err());
+    }
+    /// What the game writes at run time sits below everything packed once, from a band row,
+    /// and the glyph rows below that: the GPU holds whole bands of each (`gfx::shared_atlas`).
+    #[test]
+    fn written_images_go_below_the_fixed_ones_from_a_band_row() {
+        let band = crate::gfx::shared_atlas::BAND_ROWS;
+        let fixed = sized(70, 64, 37);
+        let written = sized(40, 128, 128);
+        let layout = HudAtlas::layout(&fixed, &written, MAX_ATLAS_SIZE).unwrap();
+        let top = layout.written.iter().map(|&(_, y)| y).min().unwrap();
+        assert_eq!(top % band, 0);
+        assert_inside(&fixed, layout.width, &layout.fixed, top);
+        assert_inside(&written, layout.width, &layout.written, layout.glyph_region);
+        // Nothing written: the glyph rows start at the band row past the fixed ones.
+        let alone = HudAtlas::layout(&fixed, &[], MAX_ATLAS_SIZE).unwrap();
+        assert_eq!(alone.glyph_region, top);
+    }
+    /// The skyline never overlaps two images, keeps a texel between them, and stays within the
+    /// width, from the row it starts at.
+    #[test]
+    fn packed_images_keep_a_texel_apart() {
+        let sizes = [
+            (64, 64),
+            (16, 16),
+            (128, 37),
+            (9, 300),
+            (500, 12),
+            (33, 33),
+            (1000, 1),
+            (7, 7),
+        ];
+        let mut images: Vec<PackedImage> = (0..400u32)
+            .map(|i| {
+                let (w, h) = sizes[i as usize % sizes.len()];
+                (format!("i{i}"), w + i % 5, h + i % 3, Vec::new())
+            })
+            .collect();
+        images.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
+        let (placed, bottom) = super::skyline(&images, 1024, 8);
+        let boxes: Vec<_> = images
+            .iter()
+            .zip(&placed)
+            .map(|((_, w, h, _), &(x, y))| (x, y, x + w + 1, y + h + 1))
+            .collect();
+        for (i, a) in boxes.iter().enumerate() {
+            assert!(a.2 <= 1024 && a.1 >= 8 && a.3 <= bottom, "{a:?} outside");
+            for b in &boxes[..i] {
+                let apart = a.2 <= b.0 || b.2 <= a.0 || a.3 <= b.1 || b.3 <= a.1;
+                assert!(apart, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+    /// A tall image's shelf leaves the room above the shorter images beside it empty; the
+    /// skyline fills it, as the on-screen keyboard's text (2048x1024) and the map slots that
+    /// come after it on the default resources.
+    #[test]
+    fn the_skyline_fills_the_room_beside_a_tall_image() {
+        let mut images = sized(1, 2048, 1024);
+        images.extend(sized(256, 128, 128));
+        let (_, shelves) = HudAtlas::shelves(&images, 4096, false);
+        let (placed, rows) = super::skyline(&images, 4096, 0);
+        assert!(rows < shelves, "{rows} rows, the shelves {shelves}");
+        let beside = placed[1..]
+            .iter()
+            .filter(|&&(x, y)| x > 2048 && y < 1024)
+            .count();
+        assert!(beside >= 15 * 7, "{beside} beside the text");
     }
 
     #[test]
