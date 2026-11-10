@@ -12597,19 +12597,41 @@ fn bake_atlas(options: &Options, vanilla_root: &std::path::Path) -> Result<()> {
     );
     let dir = std::env::current_dir()?.join("cache");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("hud-atlas-{}x{}.astc", atlas.width, atlas.height));
+    // Only the static bands, as the renderer's static pool holds them: the
+    // others are written while the game runs, which an ASTC texture cannot
+    // take (`gfx::shared_atlas`).
+    let bands = &atlas.bands;
+    let rows = bands.static_rows();
+    if rows == 0 {
+        return Err("--bake-atlas: the atlas has no static bands to bake".into());
+    }
+    let path = horizon_client::astc::atlas_path(&dir, atlas.width, rows, bands.static_key());
     let started = Instant::now();
-    horizon_client::astc::encode(&encoder, &atlas.pixels, atlas.width, atlas.height, &path)
+    let pool = bands.static_pool(&atlas.pixels);
+    horizon_client::astc::encode(&encoder, &pool, atlas.width, rows, &path)
         .map_err(|e| e.to_string())?;
+    drop(pool);
     let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
     log::info!(
         "Horizon: baked {} ({} MiB, {:.1} bpp) with {} in {:.1} s",
         path.display(),
         bytes / (1024 * 1024),
-        (bytes * 8) as f64 / (f64::from(atlas.width) * f64::from(atlas.height)),
+        (bytes * 8) as f64 / (f64::from(atlas.width) * f64::from(rows)),
         encoder.display(),
         started.elapsed().as_secs_f32()
     );
+    // Earlier bakes of the atlas (other textures, or the whole atlas as builds
+    // before the bands baked it) are never read again.
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(horizon_client::astc::ATLAS_PREFIX)
+            && name.ends_with(".astc")
+            && entry.path() != path
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
     println!("{}", path.display());
     // The block sprite arrays, packed exactly as the renderer packs them at
     // startup, so the renderer finds a bake that matches its bytes.

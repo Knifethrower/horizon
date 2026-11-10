@@ -5689,7 +5689,10 @@ impl Renderer {
     /// it without the atlas's WGSL.
     fn whole_atlas(&self) -> wgpu::Texture {
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        let whole = self.hud.atlas.whole(&self.device, &mut encoder);
+        let whole = self
+            .hud
+            .atlas
+            .whole(&self.device, &self.queue, &mut encoder);
         self.queue.submit([encoder.finish()]);
         whole
     }
@@ -11971,8 +11974,11 @@ impl Renderer {
             let size = self.world_post.size().unwrap_or([1, 1]);
             // The rain and snow sprites are copied out of the whole atlas (made
             // when the pack was set).
-            let atlas =
-                pack_draws_weather.then(|| self.hud.atlas.whole(&self.device, &mut encoder));
+            let atlas = pack_draws_weather.then(|| {
+                self.hud
+                    .atlas
+                    .whole(&self.device, &self.queue, &mut encoder)
+            });
             let weather = match &atlas {
                 Some(atlas) => self
                     .pack_weather
@@ -12166,8 +12172,11 @@ impl Renderer {
             };
             // A mod that may draw samples the shared atlas as one texture: it gets
             // it whole (made the first time, kept up to date after).
-            let atlas = native_render::world_drawn_hooked()
-                .then(|| self.hud.atlas.whole(&self.device, &mut encoder));
+            let atlas = native_render::world_drawn_hooked().then(|| {
+                self.hud
+                    .atlas
+                    .whole(&self.device, &self.queue, &mut encoder)
+            });
             native_render::native_world_drawn(&mut native_render::WorldDrawn {
                 device: &self.device,
                 queue: &self.queue,
@@ -12569,7 +12578,7 @@ impl Renderer {
         if overlay.real && !frame.title {
             // As `native_world_drawn`'s: the whole atlas for a mod that may draw.
             let atlas = native_render::world_drawn_hooked()
-                .then(|| self.hud.atlas.whole(&self.device, encoder));
+                .then(|| self.hud.atlas.whole(&self.device, &self.queue, encoder));
             native_render::native_hand_drawn(&mut native_render::HandDrawn {
                 device: &self.device,
                 queue: &self.queue,

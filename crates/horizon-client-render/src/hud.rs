@@ -3087,7 +3087,7 @@ impl HudRenderer {
     ) {
         self.pack_text = shader.and_then(|shader| {
             let mut encoder = device.create_command_encoder(&Default::default());
-            let whole = self.atlas.whole(device, &mut encoder);
+            let whole = self.atlas.whole(device, queue, &mut encoder);
             queue.submit([encoder.finish()]);
             let view = whole.create_view(&Default::default());
             pack_text::PackText::new(device, self.format, &view, shader, self.coverage)

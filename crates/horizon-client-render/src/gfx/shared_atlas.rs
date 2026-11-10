@@ -10,6 +10,10 @@
 //! GPU. A page table ([`Parts`], `atlas_pages` in `shared_atlas.wgsl`) says where each band is,
 //! and a band never written reads as transparent black, as an empty slot did.
 //!
+//! The static pool takes no writes, so it can be the ASTC bake of the static bands
+//! (`--bake-atlas`, [`crate::astc::atlas_path`]) when the GPU samples ASTC: a byte a texel
+//! instead of four.
+//!
 //! Atlas coordinates keep their meaning. Every shader that reads the atlas appends
 //! `shared_atlas.wgsl` ([`WGSL`], [`with`]) and reads through its `atlas_sample`,
 //! `atlas_linear`, `atlas_load` and `atlas_size`; its bind group layout carries the static pool
@@ -87,6 +91,9 @@ pub struct Bands {
     written: Vec<bool>,
     /// Each band: whether it is written and holds pixels once packed.
     filled: Vec<bool>,
+    /// The content key of the static bands' pixels (`astc::content_key_parts`), read while
+    /// they are in memory: what names their ASTC bake.
+    static_key: u64,
 }
 
 impl Bands {
@@ -104,26 +111,52 @@ impl Bands {
             }
         }
         let row = width as usize * 4;
+        let rows_of = |band: usize| {
+            let (top, bottom) = band_rows(height, band);
+            pixels.get(top as usize * row..bottom as usize * row)
+        };
         let filled = (0..count)
-            .map(|band| {
-                let (top, bottom) = band_rows(height, band);
-                marked[band]
-                    && pixels
-                        .get(top as usize * row..bottom as usize * row)
-                        .is_some_and(|band| band.iter().any(|&byte| byte != 0))
-            })
+            .map(|band| marked[band] && rows_of(band).is_some_and(|b| b.iter().any(|&x| x != 0)))
             .collect();
+        let static_key =
+            crate::astc::content_key_parts((0..count).filter(|&b| !marked[b]).filter_map(rows_of));
         Self {
             width,
             height,
             written: marked,
             filled,
+            static_key,
         }
     }
     /// An atlas nothing writes into in bands of its own: all of it static, run-time writes
     /// going to the static pool in place.
     pub fn all_static(width: u32, height: u32) -> Self {
         Self::new(width, height, &[], &[])
+    }
+    /// The static pool's rows: a band's for each static band, a short last one included.
+    pub fn static_rows(&self) -> u32 {
+        self.counts().0 * BAND_ROWS
+    }
+    /// The content key of the static bands' pixels: what names their ASTC bake
+    /// ([`crate::astc::atlas_path`]).
+    pub fn static_key(&self) -> u64 {
+        self.static_key
+    }
+    /// The static pool as its texture holds it, what its ASTC bake encodes: the static bands of
+    /// `pixels` (the packed atlas) in order, a short one filled to a band with transparent black.
+    pub fn static_pool(&self, pixels: &[u8]) -> Vec<u8> {
+        let row = self.width as usize * 4;
+        let mut pool = vec![0; self.static_rows() as usize * row];
+        let fixed = (0..self.written.len()).filter(|&band| !self.written[band]);
+        for (place, band) in fixed.enumerate() {
+            let (top, bottom) = band_rows(self.height, band);
+            let (from, len) = (top as usize * row, (bottom - top) as usize * row);
+            if let Some(rows) = pixels.get(from..from + len) {
+                let at = place * BAND_ROWS as usize * row;
+                pool[at..at + len].copy_from_slice(rows);
+            }
+        }
+        pool
     }
     /// The bands: static, written, and written with pixels when packed.
     pub fn counts(&self) -> (u32, u32, u32) {
@@ -227,6 +260,7 @@ impl Parts {
 }
 
 const STATIC_LABEL: &str = "Shared atlas (static bands)";
+const BAKED_LABEL: &str = "Shared atlas (static bands, ASTC)";
 const DYNAMIC_LABEL: &str = "Shared atlas (written bands)";
 
 /// The atlas on the GPU. Clones share it: a write through one is seen through all.
@@ -235,6 +269,9 @@ pub struct SharedAtlas {
     bands: Arc<Bands>,
     static_pool: wgpu::Texture,
     static_view: wgpu::TextureView,
+    /// With the static pool from its ASTC bake: the RGBA spill of the whole atlas, which
+    /// [`Self::whole`] reads the static bands from (ASTC copies into no RGBA texture).
+    baked_from: Option<Arc<Path>>,
     held: Arc<Mutex<Held>>,
     device: wgpu::Device,
 }
@@ -249,13 +286,17 @@ struct Held {
     parts: Parts,
     /// The whole atlas in one texture, once something asked for it.
     whole: Option<wgpu::Texture>,
+    /// A write into the ASTC static pool was dropped (said once).
+    dropped: bool,
 }
 
 impl SharedAtlas {
     /// The atlas `source` describes, uploaded from its pixels, or from `file` when they were
     /// spilled there (the whole atlas, RGBA): the static bands to the static pool, the written
     /// ones that hold pixels to the dynamic pool, in order. A band at a time is read, so the
-    /// transient copy stays a few MiB.
+    /// transient copy stays a few MiB. With the spill there and a GPU that samples ASTC, the
+    /// static pool is the ASTC bake beside it ([`crate::astc::atlas_path`]) when there is one,
+    /// and only the written bands are read.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -271,7 +312,26 @@ impl SharedAtlas {
             ));
         }
         let (entries, fixed, count) = bands.entries();
-        let static_pool = rgba_texture(device, STATIC_LABEL, width, (fixed * BAND_ROWS).max(1));
+        let static_rows = fixed * BAND_ROWS;
+        let baked = file.filter(|_| static_rows > 0).and_then(|spill| {
+            let path =
+                crate::astc::atlas_path(spill.parent()?, width, static_rows, bands.static_key);
+            let texture = crate::astc::load(device, queue, &path, width, static_rows, BAKED_LABEL);
+            if texture.is_none() && crate::astc::supported(device) {
+                log::info!(
+                    "Horizon: no ASTC bake {} for the shared atlas's static bands, uploading RGBA",
+                    path.display()
+                );
+            }
+            Some((texture?, Arc::<Path>::from(spill)))
+        });
+        let (static_pool, baked_from) = match baked {
+            Some((texture, spill)) => (texture, Some(spill)),
+            None => (
+                rgba_texture(device, STATIC_LABEL, width, static_rows.max(1)),
+                None,
+            ),
+        };
         let dynamic_pool = rgba_texture(device, DYNAMIC_LABEL, width, (count * BAND_ROWS).max(1));
         let started = std::time::Instant::now();
         let mut file = match (source.pixels.is_empty(), file) {
@@ -290,7 +350,10 @@ impl SharedAtlas {
         };
         let bytes_per_row = width * 4;
         let mut buf = Vec::new();
-        for (pool, place, top, bottom) in runs(height, &entries) {
+        // The bake holds the static bands already.
+        let held_runs = runs(height, &entries);
+        for &(pool, place, top, bottom) in held_runs.iter().filter(|r| r.0 || baked_from.is_none())
+        {
             let texture = if pool { &dynamic_pool } else { &static_pool };
             let chunk = (UPLOAD_BYTES / bytes_per_row).max(1);
             let mut y = top;
@@ -335,13 +398,22 @@ impl SharedAtlas {
         let (static_bands, written, _) = bands.counts();
         let mib = |rows: u32| u64::from(width) * u64::from(rows) * 4 / (1024 * 1024);
         log::info!(
-            "Horizon: shared atlas {width}x{height} {} in {} ms: {static_bands} static {BAND_ROWS}-row bands ({} MiB), {count} of {written} written ones held ({} MiB)",
+            "Horizon: shared atlas {width}x{height} {} in {} ms: {static_bands} static {BAND_ROWS}-row bands {} ({} MiB), {count} of {written} written ones held ({} MiB)",
             match &file {
                 Some((_, path)) => format!("streamed from {}", path.display()),
                 None => "uploaded".to_owned(),
             },
             started.elapsed().as_millis(),
-            mib(fixed * BAND_ROWS),
+            if baked_from.is_some() {
+                "from their ASTC bake"
+            } else {
+                "RGBA"
+            },
+            if baked_from.is_some() {
+                crate::astc::encoded_len(width, static_rows) / (1024 * 1024)
+            } else {
+                mib(static_rows)
+            },
             mib(count * BAND_ROWS),
         );
         let parts = Parts {
@@ -353,12 +425,14 @@ impl SharedAtlas {
             bands: Arc::new(bands),
             static_view: static_pool.create_view(&Default::default()),
             static_pool,
+            baked_from,
             held: Arc::new(Mutex::new(Held {
                 entries,
                 count,
                 dynamic_pool,
                 parts,
                 whole: None,
+                dropped: false,
             })),
             device: device.clone(),
         })
@@ -389,11 +463,20 @@ impl SharedAtlas {
     pub fn generation(&self) -> u64 {
         self.held().parts.generation
     }
+    /// Whether the static pool is the ASTC bake of the static bands.
+    pub fn compressed(&self) -> bool {
+        self.baked_from.is_some()
+    }
     /// What the GPU holds of each pool, in bytes: (static, dynamic).
     pub fn bytes(&self) -> (u64, u64) {
-        let rgba = |rows: u32| u64::from(self.bands.width) * u64::from(rows) * 4;
-        let (fixed, _, _) = self.bands.counts();
-        (rgba(fixed * BAND_ROWS), rgba(self.held().count * BAND_ROWS))
+        let (width, rows) = (self.bands.width, self.bands.static_rows());
+        let rgba = |rows: u32| u64::from(width) * u64::from(rows) * 4;
+        let fixed = if self.compressed() {
+            crate::astc::encoded_len(width, rows)
+        } else {
+            rgba(rows)
+        };
+        (fixed, rgba(self.held().count * BAND_ROWS))
     }
     /// The bands of the dynamic pool: (held, written).
     pub fn held_bands(&self) -> (u32, u32) {
@@ -402,7 +485,8 @@ impl SharedAtlas {
     /// Stage a run-time write of `width` by `height` RGBA texels at `x`, `y` of the atlas, into
     /// the pool each of its bands is in, and into the whole atlas when there is one. A written
     /// band it reaches is held from now on, unless all it writes there is transparent black.
-    /// A write past the atlas's edge is dropped.
+    /// A write past the atlas's edge is dropped, and so is one into a static band of the ASTC
+    /// static pool (nothing the game writes is in one).
     #[allow(clippy::too_many_arguments)]
     pub fn write(
         &self,
@@ -438,21 +522,26 @@ impl SharedAtlas {
             self.grow(&mut held, encoder, &new);
         }
         for (pool, at, skip, rows) in spans(&held.entries, y, height) {
+            if !pool && self.compressed() {
+                if !held.dropped {
+                    log::warn!(
+                        "Horizon: a run-time write at {x},{y} reached the shared atlas's ASTC static bands: dropped"
+                    );
+                    held.dropped = true;
+                }
+                continue;
+            }
             let texture = if pool {
                 &held.dynamic_pool
             } else {
                 &self.static_pool
             };
-            uploads.texture(
-                encoder,
-                copy_target(texture, x, at),
-                width,
-                rows,
-                &rgba[skip as usize * row..(skip + rows) as usize * row],
-            );
-        }
-        if let Some(whole) = &held.whole {
-            uploads.texture(encoder, copy_target(whole, x, y), width, height, rgba);
+            let data = &rgba[skip as usize * row..(skip + rows) as usize * row];
+            uploads.texture(encoder, copy_target(texture, x, at), width, rows, data);
+            // The whole atlas follows what is written.
+            if let Some(whole) = &held.whole {
+                uploads.texture(encoder, copy_target(whole, x, y + skip), width, rows, data);
+            }
         }
     }
     /// Hold the written bands `new` in the dynamic pool, after the ones held before: a pool
@@ -496,10 +585,12 @@ impl SharedAtlas {
         );
     }
     /// The whole atlas as one RGBA texture, for what samples it without the atlas's WGSL: copied
-    /// from the pools in `encoder` the first time, then kept up to date by [`Self::write`].
+    /// from the pools in `encoder` the first time (the static bands read from the spill through
+    /// `queue` when they are the ASTC bake), then kept up to date by [`Self::write`].
     pub fn whole(
         &self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) -> wgpu::Texture {
         let mut held = self.held();
@@ -509,6 +600,15 @@ impl SharedAtlas {
         let (width, height) = self.size();
         let texture = rgba_texture(device, "Shared atlas (whole)", width, height);
         for (pool, place, top, bottom) in runs(height, &held.entries) {
+            if let Some(spill) = self.baked_from.as_ref().filter(|_| !pool) {
+                if let Err(e) = rows_from(spill, queue, &texture, top, bottom) {
+                    log::warn!(
+                        "Horizon: the whole shared atlas has no static bands from {}: {e}",
+                        spill.display()
+                    );
+                }
+                continue;
+            }
             let from = if pool {
                 &held.dynamic_pool
             } else {
@@ -530,6 +630,45 @@ impl SharedAtlas {
         held.whole = Some(texture.clone());
         texture
     }
+}
+
+/// Rows `top..bottom` of the RGBA spill of an atlas at `path` into the same rows of `texture`,
+/// a few MiB at a time.
+fn rows_from(
+    path: &Path,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    top: u32,
+    bottom: u32,
+) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let bytes_per_row = texture.width() * 4;
+    let chunk = (UPLOAD_BYTES / bytes_per_row).max(1);
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(u64::from(top) * u64::from(bytes_per_row)))?;
+    let mut buf = Vec::new();
+    let mut y = top;
+    while y < bottom {
+        let rows = chunk.min(bottom - y);
+        buf.resize((rows * bytes_per_row) as usize, 0);
+        file.read_exact(&mut buf)?;
+        queue.write_texture(
+            copy_target(texture, 0, y),
+            &buf,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d {
+                width: texture.width(),
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        y += rows;
+    }
+    Ok(())
 }
 
 /// The rows a band starts at in the pool its page table entry `place` names: (in the dynamic

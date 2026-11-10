@@ -218,14 +218,14 @@ fn the_dynamic_pool_holds_only_the_bands_written() {
         pixels[at..at + (w * 4) as usize]
             .copy_from_slice(&patch[(row * w * 4) as usize..((row + 1) * w * 4) as usize]);
     }
-    let whole = atlas.whole(&device, &mut encoder);
+    let whole = atlas.whole(&device, &queue, &mut encoder);
     assert!(read_back(&device, &queue, encoder, &whole) == pixels);
     // From now on the whole atlas follows the writes too.
     let mut encoder = device.create_command_encoder(&Default::default());
     atlas.write(&mut uploads, &mut encoder, 9, 5, 1, 1, &[1, 2, 3, 4]);
     uploads.finish(&encoder);
     pixels[((5 * width + 9) * 4) as usize..][..4].copy_from_slice(&[1, 2, 3, 4]);
-    let whole = atlas.whole(&device, &mut encoder);
+    let whole = atlas.whole(&device, &queue, &mut encoder);
     assert!(read_back(&device, &queue, encoder, &whole) == pixels);
 }
 
@@ -420,4 +420,115 @@ fn a_draw_reads_the_split_atlas_as_one_texture() {
         .max()
         .unwrap();
     assert!(worst <= 1, "atlas_linear differs by {worst}");
+}
+
+/// The static pool, as its texture and its bake hold it: the static bands in order, a short
+/// one filled to a band; named by a key of their pixels alone.
+#[test]
+fn the_static_pool_is_the_static_bands_in_order() {
+    let (width, height, mut pixels, written) = atlas_pixels();
+    let bands = Bands::new(width, height, &written, &pixels);
+    assert_eq!(bands.static_rows(), 3 * BAND_ROWS);
+    let pool = bands.static_pool(&pixels);
+    let row = (width * 4) as usize;
+    let band = |b: u32, rows: u32| &pixels[(b * BAND_ROWS) as usize * row..][..rows as usize * row];
+    let b = BAND_ROWS as usize * row;
+    assert!(pool[..b] == *band(0, BAND_ROWS));
+    assert!(pool[b..2 * b] == *band(4, BAND_ROWS));
+    assert!(pool[2 * b..2 * b + 20 * row] == *band(5, 20));
+    assert!(pool[2 * b + 20 * row..].iter().all(|&byte| byte == 0));
+    // A written band's pixels name no bake; a static band's do.
+    let key = bands.static_key();
+    pixels[BAND_ROWS as usize * row + 40] ^= 1;
+    assert_eq!(
+        Bands::new(width, height, &written, &pixels).static_key(),
+        key
+    );
+    pixels[4 * BAND_ROWS as usize * row + 40] ^= 1;
+    assert_ne!(
+        Bands::new(width, height, &written, &pixels).static_key(),
+        key
+    );
+}
+
+/// An ASTC 4x4 block of one colour (a void-extent block): `rgba` as 16-bit UNORM.
+fn solid_block(rgba: [u16; 4]) -> [u8; 16] {
+    let mut block = [0xff; 16];
+    block[..2].copy_from_slice(&[0xfc, 0xfd]);
+    for (i, c) in rgba.iter().enumerate() {
+        block[8 + 2 * i..10 + 2 * i].copy_from_slice(&c.to_le_bytes());
+    }
+    block
+}
+
+/// With the spill and its bake there and a GPU that samples ASTC, the static bands are the
+/// bake (what it holds is what draws read), the written ones come from the spill, the whole
+/// atlas reads its static bands from the spill, and a write into a static band is dropped.
+#[test]
+fn the_static_bands_load_from_their_bake() {
+    let instance = crate::gfx::test_gpu::instance();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        eprintln!("no adapter: skipped");
+        return;
+    };
+    let astc = wgpu::Features::TEXTURE_COMPRESSION_ASTC;
+    if !adapter.features().contains(astc) {
+        eprintln!("the adapter samples no ASTC: skipped");
+        return;
+    }
+    let descriptor = wgpu::DeviceDescriptor {
+        required_features: astc,
+        ..Default::default()
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).unwrap();
+    let (width, height, pixels, written) = atlas_pixels();
+    let bands = Bands::new(width, height, &written, &pixels);
+    let dir = std::env::temp_dir().join(format!("horizon-atlas-bake-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spill = dir.join("hud-atlas.rgba");
+    std::fs::write(&spill, &pixels).unwrap();
+    let rows = bands.static_rows();
+    let bake = crate::astc::atlas_path(&dir, width, rows, bands.static_key());
+    let blocks = (width / 4 * rows / 4) as usize;
+    let solid = solid_block([0x8080, 0xffff, 0, 0xffff]);
+    std::fs::write(&bake, solid.repeat(blocks)).unwrap();
+    let source = Source {
+        pixels: &[],
+        width,
+        height,
+        bands: Cow::Owned(bands),
+    };
+    let atlas = SharedAtlas::new(&device, &queue, &source, Some(&spill)).unwrap();
+    assert!(atlas.compressed());
+    assert_eq!(atlas.bytes().0, crate::astc::encoded_len(width, rows));
+    // A write into static band 0 is dropped.
+    let mut uploads = Uploads::new(&device);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    atlas.write(&mut uploads, &mut encoder, 2, 3, 1, 1, &[9, 9, 9, 9]);
+    uploads.finish(&encoder);
+    queue.submit([encoder.finish()]);
+    let reads = draw_reads(
+        &device,
+        &queue,
+        atlas.view(),
+        &atlas.parts(),
+        (width, height),
+    );
+    for y in 0..height {
+        let band = y / BAND_ROWS;
+        let at = (y * width * 4) as usize;
+        let row = &reads[0][at..at + (width * 4) as usize];
+        if band == 0 || band >= 4 {
+            assert!(
+                row.chunks(4).all(|texel| texel == [128, 255, 0, 255]),
+                "row {y}"
+            );
+        } else {
+            assert!(row == &pixels[at..at + (width * 4) as usize], "row {y}");
+        }
+    }
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let whole = atlas.whole(&device, &queue, &mut encoder);
+    assert!(read_back(&device, &queue, encoder, &whole) == pixels);
+    let _ = std::fs::remove_dir_all(&dir);
 }
