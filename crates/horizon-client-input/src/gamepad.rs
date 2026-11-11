@@ -1760,13 +1760,37 @@ pub fn bow_power(ticks: u32) -> f32 {
     ((f * f + f * 2.0) / 3.0).min(1.0)
 }
 
-/// `SDL_GAMECONTROLLERCONFIG` with a mapping file's rows in it, or `None` when the file has none. The
+/// SDL's GUID of an input device from its bus type, vendor, product and version: each one as two
+/// little-endian bytes and two zero bytes, in hex.
+pub fn sdl_guid(ids: [u16; 4]) -> String {
+    ids.iter()
+        .map(|id| {
+            let [low, high] = id.to_le_bytes();
+            format!("{low:02x}{high:02x}0000")
+        })
+        .collect()
+}
+
+/// `SDL_GAMECONTROLLERCONFIG` with a mapping file's rows for these pads (SDL GUIDs) in it, or `None`
+/// when it has none of theirs. Only those: the file can be the whole SDL database (600 KB on muOS),
+/// and one environment string over 128 KiB makes every program this one starts fail with E2BIG. The
 /// last row for a pad wins, so the variable's own rows stay ahead of the file's, as in SDL.
-pub fn sdl_config_with_file(file_rows: &str, config: Option<&str>) -> Option<String> {
-    if file_rows.trim().is_empty() {
+pub fn sdl_config_with_file(
+    file_rows: &str,
+    pads: &[String],
+    config: Option<&str>,
+) -> Option<String> {
+    let rows: Vec<&str> = file_rows
+        .lines()
+        .filter(|row| {
+            let guid = row.split(',').next().unwrap_or("").trim();
+            pads.iter().any(|pad| pad.eq_ignore_ascii_case(guid))
+        })
+        .collect();
+    if rows.is_empty() {
         return None;
     }
-    Some(format!("{file_rows}\n{}", config.unwrap_or("")))
+    Some(format!("{}\n{}", rows.join("\n"), config.unwrap_or("")))
 }
 
 #[cfg(test)]
@@ -1775,10 +1799,36 @@ mod tests {
 
     #[test]
     fn a_mapping_file_comes_before_the_variables_rows() {
-        assert_eq!(sdl_config_with_file("", None), None);
-        assert_eq!(sdl_config_with_file(" \n", Some("row")), None);
-        assert_eq!(sdl_config_with_file("file", None).as_deref(), Some("file\n"));
-        assert_eq!(sdl_config_with_file("file", Some("own")).as_deref(), Some("file\nown"));
+        let pads = ["aa".to_owned()];
+        assert_eq!(sdl_config_with_file("", &pads, None), None);
+        assert_eq!(sdl_config_with_file(" \n", &pads, Some("row")), None);
+        assert_eq!(
+            sdl_config_with_file("aa,pad", &pads, None).as_deref(),
+            Some("aa,pad\n")
+        );
+        assert_eq!(
+            sdl_config_with_file("aa,pad", &pads, Some("own")).as_deref(),
+            Some("aa,pad\nown")
+        );
+    }
+
+    #[test]
+    fn a_whole_database_gives_only_the_rows_of_the_pads_there_are() {
+        let pads = [sdl_guid([0x19, 0x484b, 0x1100, 0x100])];
+        assert_eq!(pads[0], "190000004b4800000011000000010000");
+        let other = format!("{},Other,a:b0,platform:Linux,\n", "00".repeat(16));
+        let row = format!("{},GO-Super Gamepad,a:b1,platform:Linux,", pads[0]);
+        let file = format!(
+            "# a comment\n{}{row}\n{}",
+            other.repeat(3000),
+            other.repeat(3000)
+        );
+        assert!(file.len() > 128 * 1024);
+        assert_eq!(
+            sdl_config_with_file(&file, &pads, None),
+            Some(format!("{row}\n"))
+        );
+        assert_eq!(sdl_config_with_file(&other, &pads, None), None);
     }
 
     #[test]
